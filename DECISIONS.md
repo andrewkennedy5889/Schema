@@ -21,6 +21,23 @@ How to add new entries: see `UPDATING.md`.
 
 ---
 
+## 2026-04-23 — Person profile extensions: LinkedIn URL, past employment, author-owned notes
+
+**Affects**: `"Person(s)"`, `"Person(s)_employment_history"` (new), `"Person(s)_notes"` (new), `"Person(s)_note_shares"` (new), `"Person(s)_contact_shares"`, `public.can_view_person_contact()`, Rules 5 and 9
+**Decision**: Extended the Person profile with three surfaces, each with a fitting visibility model:
+- **LinkedIn**: `linkedin_url text` column + `linkedin_visibility` tier on `"Person(s)"`. Reuses the Rule 5 3-tier model.
+- **Past employment**: new `"Person(s)_employment_history"` with per-row `visibility` tier. `employer_name` is **free text**, not an FK to `"org(s)"` — former employers typically are not tenants of this system. Only *past* jobs live here; current employer stays on `"Person(s)"."Person's_org"`.
+- **Notes**: new `"Person(s)_notes"` + `"Person(s)_note_shares"`. Notes have author + subject; default visibility is author-only (no tier column). Widening is exclusively via `"Person(s)_note_shares"` rows targeting Entities. The subject is never an automatic viewer.
+
+Extended `Person(s)_contact_shares` with `includes_linkedin` and `includes_employment` boolean flags. Extended `can_view_person_contact()` channel argument to accept `'linkedin'` and `'employment'`.
+**Why**: User needed LinkedIn URL, past employers with titles, and per-person freeform notes, plus the ability to share each of these separately with specific Entities (own Org, any Div1..5, internal or external Entities — all reachable through the Rule 8 Entity-wrapping pattern). Reusing `can_view_person_contact` keeps the visibility story in one place for the tier-based surfaces (emails, phones, LinkedIn, employment). Notes use a different privacy model because their default ("only the writer") differs from contact rows' default ("whole org") — a tier on notes would be misleading.
+**Alternatives rejected**:
+- Universal "property moment node" subtype housing LinkedIn, employment, and notes under one polymorphic schema: loses typed columns, makes simple queries ("read this Person's LinkedIn") verbose JSON lookups, and drags in Rule 11 partitioning for fields that don't need it. User explicitly chose to avoid these costs once named.
+- FK `employment_history.employer_name → "org(s)".name`: forces loading non-tenant historical employers into the tenant-owned `"org(s)"` table.
+- Note visibility encoded as a 4th tier value (e.g. `'author_only'`): muddies Rule 5 for no gain, since notes would never use the other three tier values.
+- RLS auto-granting the subject SELECT on notes written about them: rejected per user choice 2026-04-23 — matches standard HR/CRM behavior where the subject does not see notes unless explicitly shared.
+- Unifying note shares with `Person(s)_contact_shares` via an `includes_notes` flag: notes' share targets are always Entities (never direct users) and their sharer is always the author (no delegation path), so the unified row would require nullable columns that never apply to notes. Separate table stays cleaner.
+
 ## 2026-04-22 — Tenant DB reorganized into 9 numbered grouping schemas
 
 **Affects**: All 45 tables, all 22 helper/trigger functions, Rule 16, Rule 9, Data API exposure
