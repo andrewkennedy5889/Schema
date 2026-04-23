@@ -702,6 +702,35 @@ deletes from either side.
 - `position smallint` nullable — display order within the title's bundle.
 - RLS: SELECT/INSERT/DELETE gated via EXISTS on parent `title(s).org_id`.
 
+### `"recurring_task(s)"`
+
+Scheduled spawn of `moment_node(s)` of type Task on a cadence. Serves as
+the bridge between a `"responsibility(s)"` and the concrete Task nodes
+that fulfill it over time.
+
+- PK `id uuid`. `org_id uuid` NOT NULL FK `"org(s)".id`.
+- `name text` NOT NULL 1..160; `description text` nullable.
+- `responsibility_id uuid` NOT NULL FK `"responsibility(s)".id`
+  `ON DELETE CASCADE` — parent accountability.
+- `node_template_id uuid` NOT NULL FK `"node_template(s)".id`
+  `ON DELETE CASCADE` — the shape each spawn inherits.
+- `owner_entity_id uuid` NOT NULL FK `"Entity(s)".id` `ON DELETE RESTRICT`
+  — Rule 8 universal target; responsible Entity.
+- `cadence_cron text` NOT NULL (5/6-field cron expression);
+  `timezone text` NOT NULL default `'UTC'` (IANA).
+- `next_due_at timestamptz` nullable — maintained by the spawner job,
+  not a DB trigger. NULL = paused or never computed.
+- `last_spawned_at timestamptz` — last successful spawn.
+- `obligation obligation_kind` nullable — Rule 15 shared ENUM
+  (`recommended | mandatory | prohibitive`); NULL when no framing.
+- `policy_id uuid` nullable FK `"policy(s)".id` `ON DELETE SET NULL` —
+  backing policy when the obligation traces to one.
+- `is_active boolean` NOT NULL default `true`; `deleted_at timestamptz`.
+- **Invariant trigger** `public.enforce_recurring_task_invariants`:
+  validates `responsibility.org_id = node_template.org_id = owner_entity.org_id = this.org_id`.
+- `updated_at` maintained by `public.touch_updated_at`.
+- RLS: full CRUD per Rule 10, gated on `org_id = current_user_org()`.
+
 ---
 
 ## Tables — Workflow / Process containers
