@@ -850,6 +850,17 @@ rows per tenant at scale.
 - Status transitions logged to `status_change_log`.
 - RLS enabled on parent AND each partition. Policies declared on parent;
   direct-to-partition queries are deny-by-default (intended safety net).
+- `responsibility_id uuid` nullable FK `"responsibility(s)".id`
+  `ON DELETE SET NULL` — optional link to the parent Responsibility this
+  node fulfills. NULL = extra-curricular action (Q14 of 2026-04-23
+  planning). Typically populated for node_type=task; nullable on all.
+- `spawned_from_recurring_task_id uuid` nullable FK
+  `"recurring_task(s)".id` `ON DELETE SET NULL` — provenance marker for
+  scheduler-spawned tasks. NULL = ad-hoc. Typically only set for
+  node_type=task.
+- Partial indexes on each of the two new FK columns
+  (`WHERE <col> IS NOT NULL`) to keep lookups tight on mostly-NULL
+  columns at moment-node scale.
 
 ---
 
