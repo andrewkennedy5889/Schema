@@ -21,6 +21,17 @@ How to add new entries: see `UPDATING.md`.
 
 ---
 
+## 2026-04-22 — Tenant DB reorganized into 9 numbered grouping schemas
+
+**Affects**: All 45 tables, all 22 helper/trigger functions, Rule 16, Rule 9, Data API exposure
+**Decision**: The 45 tables in the multi-tenant Supabase database (project `xffuegarpwigweuajkea`) were moved out of `public` into nine new schemas: `"01_tenancy"`, `"02_hierarchy"`, `"03_metadata"`, `"04_entities"`, `"05_contact"`, `"06_templates"`, `"07_runtime"`, `"08_moments"`, `"09_governance"`. Schema names are two-digit-prefix-first, so every reference requires double-quoting. Applied via three migrations in order: `create_9_grouping_schemas`, `move_tables_into_grouping_schemas`, `rewrite_functions_for_new_schemas`. All 22 public functions had their `search_path` widened to include all 9 schemas + `public` + `pg_temp`; 11 of them had hard-coded `public.<table>` body references rewritten with new schema-qualified names. Helper/trigger functions stay in `public` — they were **not** moved. RLS policies, triggers, FK constraints, and indexes followed their parent tables automatically.
+**Why**: A flat `public` schema with 45 tables becomes impenetrable as the tenant DB grows — new sessions have no landmarks for where a table belongs or should be added. Numeric prefixes enforce a reading order that mirrors the conceptual layers (identity → hierarchy → metadata → groups → contact → templates → runtime → moments → governance), making a new table's schema assignment obvious by domain fit. Supabase Studio's schema picker, migration grouping, and RLS reasoning all benefit. The user requested "numbers in front of the names" literally; accepted the always-quoted cost as the correct tradeoff over a letter prefix.
+**Alternatives rejected**:
+- Keep flat `public`: untenable past ~30 tables; no natural landing place for new additions.
+- `sNN_tenancy` style (letter prefix to avoid quoting): cheaper ergonomically but the `s` adds zero meaning and deviated from the literal numbered grouping the user asked for.
+- Move helper functions into schemas alongside tables: keeping them in `public` centralizes `auth.uid()`-aware helpers and avoids cross-schema search_path issues. Reconsider if the function set grows large.
+- Drop `public` entirely: would orphan Supabase's `graphql_public`, `auth`, `storage`, etc. and break search_path assumptions.
+
 ## 2026-04-22 — Org classification via sysadmin-managed global `org_types` catalog; exactly-one per org
 
 **Affects**: org_types, org(s).org_type_id, enforce_org_types_max_rows(), migrations `add_system_admins_and_org_types` + `org_type_id_not_null`

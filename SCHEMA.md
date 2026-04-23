@@ -1,9 +1,11 @@
 # SCHEMA — Multi-Tenant Application Database
 
-Current-state truth for the Supabase schema (project `xffuegarpwigweuajkea`,
-schema `public`). This file is **always** up-to-date; if you find it stale,
-either fix it in the same response as the migration you're running, or flag
-the drift explicitly.
+Current-state truth for the Supabase schema (project `xffuegarpwigweuajkea`).
+Tables are distributed across 9 numbered grouping schemas; `public` now holds
+only helper/trigger functions. See House Rule 16 for the full table→schema
+map. This file is **always** up-to-date; if you find it stale, either fix it
+in the same response as the migration you're running, or flag the drift
+explicitly.
 
 Per-column detail lives in SQL `COMMENT ON`. Query via the Supabase MCP — do
 not duplicate column text here. Historical rationale lives in `DECISIONS.md`.
@@ -109,7 +111,7 @@ decision entry.
   generator, policy author, etc.) can FK to `"Entity(s)".id` uniformly
   whether the referent is an individual or a group.
 
-### 9. RLS helper functions (all `SECURITY DEFINER`, `search_path = public, pg_temp`)
+### 9. RLS helper functions (all `SECURITY DEFINER`, `search_path` widened per Rule 16)
 
 - `current_user_org()` → viewer's tenant (pre-existing; re-declared in
   phase_1_foundation_extensions to pin search_path).
@@ -138,8 +140,9 @@ decision entry.
 
 ### 11. `"moment_node(s)"` is LIST-partitioned; FKs into it carry the partition key
 
-- `"moment_node(s)"` is partitioned `BY LIST (node_type)` into four child
-  partitions (`_event`, `_action`, `_decision`, `_task`). Primary key is
+- `"08_moments"."moment_node(s)"` is partitioned `BY LIST (node_type)` into
+  four child partitions (`_event`, `_action`, `_decision`, `_task`). Primary
+  key is
   composite `(id, node_type)` — Postgres requires the partition key in any
   unique constraint on a partitioned table.
 - Any column pointing at a moment node must therefore carry a companion
@@ -205,6 +208,35 @@ decision entry.
 - Used by `"policy(s)".kind` and `task_prescription_options.obligation`.
   Do not recreate this as per-table CHECK constraints — edit the ENUM in
   one place.
+
+### 16. Tables live in 9 numbered grouping schemas; `public` holds only helpers
+
+- The 45 tables are distributed across nine schemas whose names start with
+  a two-digit prefix. Schema identifiers must be double-quoted at every
+  reference site (`"05_contact"."Person(s)_emails"`).
+
+  | Schema | Contents |
+  |---|---|
+  | `"01_tenancy"` | `"org(s)"`, `org_types`, `"Person(s)"`, `system_admins` |
+  | `"02_hierarchy"` | `Div1..Div5` |
+  | `"03_metadata"` | `table_registry`, `table_nicknames` |
+  | `"04_entities"` | `"Entity(s)"`, `"Entity(s)_members"` |
+  | `"05_contact"` | `"Person(s)_emails"`, `"Person(s)_phones"`, `"Person(s)_contact_shares"`, `"Person(s)_contact_share_delegations"` |
+  | `"06_templates"` | `"workflow_template(s)"`, `"process_template(s)"`, `workflow_template_processes`, `"node_template(s)"`, `process_template_node_edges`, `process_template_milestones`, `milestone_conditions`, `task_prescription_options` |
+  | `"07_runtime"` | `"workflow(s)"`, `"process(s)"`, `status_change_log`, `process_milestone_hits` |
+  | `"08_moments"` | `"moment_node(s)"` (partitioned) + 4 subtype partitions + `moment_node_sources`/`_owners`/`_affected`, `decision_justifications` |
+  | `"09_governance"` | `"policy(s)"`, `"evidence_node(s)"`, `"evidence_property(s)"`, `policy_supporting_evidence`, `"attest(s)"`, `attest_comments`, `attest_visibility` |
+
+- `public` keeps all 22 helper/trigger functions. Function `search_path` is
+  widened to include all 9 schemas plus `public, pg_temp`, so unqualified
+  table references inside function bodies continue to resolve. Functions
+  with hard-coded `public.<table>` references were rewritten to point at
+  the new schema locations.
+- When adding a new table, pick its schema by domain fit. If ambiguous,
+  re-read the 2026-04-22 "Tenant DB reorganized into 9 numbered schemas"
+  DECISIONS entry.
+- Supabase Data API (PostgREST) must have all 9 schemas listed under
+  Project Settings → Data API → **Exposed schemas** for client access.
 
 ---
 
