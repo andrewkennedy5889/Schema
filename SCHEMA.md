@@ -1415,3 +1415,30 @@ must be populated (`node_template_phys_req_exactly_one` CHECK):
   happens at moment-node creation time (out of scope for this template
   layer).
 - RLS gated via parent `"node_template(s)"`.org_id`.
+
+---
+
+## Views (`public`)
+
+### `public.effective_roles`
+
+Read-model combining direct role assignments and title-bundled roles.
+Q18 locked derive-not-materialize: title bundles are NOT inserted as
+rows in `role_assignments`; this view unions them at query time.
+
+- Columns: `entity_id uuid`, `role_id uuid`, `org_id uuid`, `source text`
+  (`'direct' | 'from_title'`), `effective_since timestamptz`,
+  `assignment_id uuid` (NULL for from_title rows), `title_id uuid`
+  (NULL for direct rows).
+- Built with `security_invoker = true` — underlying RLS on
+  `role_assignments`, `"Person(s)"`, `"title(s)"`, and `title_roles`
+  applies to the querying user naturally.
+- Direct rows: `role_assignments` where `revoked_at IS NULL`.
+- Bundled rows: for each active Person with a `title_id`, joins
+  `title_roles` and yields `entity_id = public.person_solo_entity_id(p.id)`.
+- `effective_since` is `GREATEST(p.updated_at, tr.created_at)` for
+  bundled rows — approximates "since when"; not audit-grade.
+- `GRANT SELECT` to `authenticated`.
+- Consumers wanting distinct role-holding ("does entity X hold role Y?")
+  should use `EXISTS` or `SELECT DISTINCT role_id`; the union may return
+  the same (entity, role) via both sources simultaneously.
