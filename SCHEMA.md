@@ -735,6 +735,19 @@ that fulfill it over time.
 
 ## Tables — Workflow / Process containers
 
+> **Swim-lane column (cross-cutting, Migration 8):** All six tables in
+> this section — `"workflow_template(s)"`, `"process_template(s)"`,
+> `"node_template(s)"`, `"workflow(s)"`, `"process(s)"`, and
+> `"moment_node(s)"` — carry a nullable
+> `declared_primary_swim_lane_id bigint` FK to
+> `"03_metadata"."swim_lane(s)".id` `ON DELETE SET NULL`, with a partial
+> index on non-NULL values. Templates declare a lane; instances
+> typically copy-on-spawn from their template (Rule 13) and may
+> override. Task-level moment_nodes may differ from their parent
+> workflow's lane (Q9-vs-original-brief). The **recommended** lane for
+> a container is computed on read from its children's mix — never
+> stored — per Q9.
+
 ### `"workflow_template(s)"`
 
 Reusable workflow blueprint. Composes process templates many-to-many.
