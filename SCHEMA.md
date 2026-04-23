@@ -59,13 +59,22 @@ decision entry.
   things, prefix the column with its role (`member_org_id`, `target_org_id`).
 - Never overload `org_id` for non-tenant meaning.
 
-### 5. Visibility tiers on per-Person contact rows
+### 5. Visibility tiers on per-Person profile surfaces
 
 - Enum: `'private' | 'org' | 'shareable'`.
 - `'private'` → only the Person themselves.
 - `'org'` → same-org viewers (default).
 - `'shareable'` → same-org **and** anyone actively shared with.
-- Default is `'org'`. Sharing is opt-in per row.
+- Default is `'org'`. Sharing is opt-in per row or per field.
+- Applied to: per-row contact (`Person(s)_emails`, `Person(s)_phones`),
+  per-row employment (`Person(s)_employment_history`), and per-field
+  profile columns on `Person(s)` itself (currently `linkedin_url` via
+  `linkedin_visibility`).
+- Widening to 'shareable' is resolved via `can_view_person_contact(owner,
+  visibility, channel)` with `channel IN ('email','phone','linkedin','employment')`
+  selecting the matching `Person(s)_contact_shares.includes_*` flag.
+- Notes (`Person(s)_notes`) do NOT use this tier — they are author-only
+  by default and widen only through explicit `Person(s)_note_shares` rows.
 - Does NOT apply to attests — those use explicit ACL rows plus target-type
   branching (see `"attest(s)"`).
 
@@ -118,8 +127,10 @@ decision entry.
 - `current_user_person_id()` → viewer's Person row.
 - `entities_current_user_is_member_of()` → set of Entity(s) IDs the viewer
   belongs to, via Person / org / Div1..5 paths.
-- `can_view_person_contact(owner, visibility, channel)` → central contact
+- `can_view_person_contact(owner, visibility, channel)` → central profile
   visibility predicate (self OR same-org-and-tier OR active-share-and-tier).
+  `channel IN ('email','phone','linkedin','employment')` picks which
+  `Person(s)_contact_shares.includes_*` flag is matched.
 - `current_user_can_share_for(owner)` → owner-or-active-delegate check,
   used by INSERT policy on shares.
 - `person_solo_entity_id(person_id)` → returns the solo-Entity id for the
@@ -221,7 +232,7 @@ decision entry.
   | `"02_hierarchy"` | `Div1..Div5` |
   | `"03_metadata"` | `table_registry`, `table_nicknames` |
   | `"04_entities"` | `"Entity(s)"`, `"Entity(s)_members"` |
-  | `"05_contact"` | `"Person(s)_emails"`, `"Person(s)_phones"`, `"Person(s)_contact_shares"`, `"Person(s)_contact_share_delegations"` |
+  | `"05_contact"` | `"Person(s)_emails"`, `"Person(s)_phones"`, `"Person(s)_employment_history"`, `"Person(s)_notes"`, `"Person(s)_note_shares"`, `"Person(s)_contact_shares"`, `"Person(s)_contact_share_delegations"` |
   | `"06_templates"` | `"workflow_template(s)"`, `"process_template(s)"`, `workflow_template_processes`, `"node_template(s)"`, `process_template_node_edges`, `process_template_milestones`, `milestone_conditions`, `task_prescription_options` |
   | `"07_runtime"` | `"workflow(s)"`, `"process(s)"`, `status_change_log`, `process_milestone_hits` |
   | `"08_moments"` | `"moment_node(s)"` (partitioned) + 4 subtype partitions + `moment_node_sources`/`_owners`/`_affected`, `decision_justifications` |
@@ -268,6 +279,10 @@ A person within an org. May or may not have an `auth.users` login.
   parts. No uniqueness — name collisions are expected and allowed.
 - `username text GENERATED ALWAYS AS (first_name || ' ' || last_name) STORED` —
   display handle; NEVER written directly.
+- `linkedin_url text` nullable — LinkedIn profile URL.
+- `linkedin_visibility text` NOT NULL default `'org'`, CHECK
+  `IN ('private','org','shareable')` — per Rule 5. Widens to 'shareable'
+  via `Person(s)_contact_shares.includes_linkedin = true`.
 - `is_active boolean` NOT NULL default `true`; `deactivated_at timestamptz`
   nullable; `deleted_at timestamptz` nullable (soft delete).
 - `updated_at timestamptz` (trigger-maintained), plus
@@ -417,8 +432,9 @@ Grants view of `visibility='shareable'` contact rows to an auth user
 - `sharer_person_id uuid` — who created this share (owner or active delegate).
 - `target_user_id uuid` FK `auth.users.id` — OR
   `target_entity_id uuid` FK `Entity(s).id`. CHECK: exactly one populated.
-- `includes_emails boolean`, `includes_phones boolean` — channel flags;
-  at least one must be true.
+- `includes_emails`, `includes_phones`, `includes_linkedin`, `includes_employment`
+  (boolean, default false) — per-channel flags controlling which profile
+  surfaces this share exposes. At least one must be true.
 - Soft-revoke via `revoked_at timestamptz`.
 - Partial unique indexes prevent duplicate **active** shares per
   (owner, target).
@@ -440,6 +456,67 @@ Authorizes a Person or Entity to create shares of the owner's contact.
   sharer and this owner was the owner. Owner's own shares untouched.
 - RLS: SELECT visible to owner, delegate Person, and members of delegate
   Entity. Only owner can INSERT/UPDATE/DELETE.
+
+---
+
+## Tables — Person profile extensions
+
+### `"Person(s)_employment_history"`
+
+Past jobs for a Person. Current employer lives on
+`"Person(s)"."Person's_org"`.
+
+- `person_id uuid` FK `"Person(s)".id` ON DELETE CASCADE.
+- `org_id uuid` FK `"org(s)".id` — viewing-tenant boundary.
+- `employer_name text` NOT NULL — free text. Former employers are
+  typically not tenants of this system, so no FK into `"org(s)"`.
+- `title text` nullable.
+- `start_date date`, `end_date date`, CHECK
+  `end_date IS NULL OR start_date IS NULL OR end_date >= start_date`.
+- `visibility text` NOT NULL default `'org'`, CHECK
+  `IN ('private','org','shareable')` — per Rule 5. Widens to 'shareable'
+  via `Person(s)_contact_shares.includes_employment = true`.
+- `deleted_at timestamptz` nullable (soft delete).
+- Trigger `employment_history_set_updated_at` (BEFORE UPDATE) maintains
+  `updated_at`.
+- RLS SELECT via `can_view_person_contact(person_id, visibility, 'employment')`.
+  INSERT/UPDATE/DELETE owner-only via `current_user_person_id()`.
+
+### `"Person(s)_notes"`
+
+Freeform notes about a Person, written by *another* Person. Default
+visibility is author-only; widening is via `Person(s)_note_shares`. The
+subject (the Person the note is about) is never an automatic viewer.
+
+- `subject_person_id uuid` FK `"Person(s)".id` ON DELETE CASCADE.
+- `author_person_id uuid` FK `"Person(s)".id`.
+- `org_id uuid` FK `"org(s)".id` — author's tenant.
+- `body text` NOT NULL.
+- `deleted_at timestamptz` nullable.
+- **No `visibility` tier column.** Sharing is strictly via the shares
+  table, because notes' default ("only the writer sees it") differs from
+  contact rows' default ("whole org sees it") — a tier would be misleading.
+- Trigger `notes_set_updated_at` (BEFORE UPDATE) maintains `updated_at`.
+- RLS SELECT: author OR a member of any Entity with an active
+  `Person(s)_note_shares` row targeting this note.
+  INSERT/UPDATE/DELETE: author-only via `current_user_person_id()`.
+
+### `"Person(s)_note_shares"`
+
+Author-controlled expansion of note visibility to additional viewers.
+
+- `note_id uuid` FK `"Person(s)_notes".id` ON DELETE CASCADE.
+- `sharer_person_id uuid` FK `"Person(s)".id` — the note's author. No
+  delegation path (unlike `Person(s)_contact_shares`).
+- `target_entity_id uuid` FK `"Entity(s)".id` NOT NULL — per Rule 8,
+  single users are represented via their solo Entity.
+- Soft-revoke via `revoked_at timestamptz`.
+- Partial unique `(note_id, target_entity_id) WHERE revoked_at IS NULL`
+  prevents duplicate active shares to the same target.
+- RLS SELECT: sharer OR members of `target_entity_id`.
+  INSERT: `sharer_person_id = current_user_person_id()` AND the note's
+  `author_person_id` must also be the current user.
+  UPDATE/DELETE: sharer only.
 
 ---
 
