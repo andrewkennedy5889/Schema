@@ -122,6 +122,9 @@ decision entry.
   used by INSERT policy on shares.
 - `person_solo_entity_id(person_id)` → returns the solo-Entity id for the
   given Person (see Rule 8).
+- `is_system_admin()` → boolean; true iff `auth.uid()` has a row in
+  `system_admins`. Used by `org_types` RLS and will be used by any future
+  sysadmin-gated table.
 
 ### 10. Tenant-owned tables get full CRUD RLS; admin-managed tables get SELECT-only
 
@@ -215,8 +218,9 @@ Root tenant table. Every other tenant-owned row points back here.
 - `active_div_levels smallint` (1–5, default 5, CHECK-constrained) — how
   many Div levels this tenant uses. UI and validation respect this.
 - `slug text` unique, nullable — tenant URL slug.
-- `org_type_id bigint` NOT NULL, FK `org_types.id` — classification of
-  the tenant (see `org_types` below).
+- `org_type_id bigint` NOT NULL, FK `org_types.id` ON DELETE RESTRICT —
+  classification of the tenant (see `org_types` below). RESTRICT is the
+  only FK action compatible with the NOT NULL invariant.
 - RLS: enabled. Policy set not yet audited here (pre-existing from initial setup).
 
 ### `"Person(s)"`
@@ -266,19 +270,25 @@ Chained below `Div1` via `parent_id`. RLS traces the parent chain up to
 Cross-tenant privileged role. A user listed here has system-admin access
 regardless of tenant. Intentionally has no `org_id` — scope is global.
 
-- PK `user_id uuid` (FK `auth.users.id`).
-- RLS: enabled. Policy set pre-existing; not captured here — see migration
-  `add_system_admins_and_org_types` (2026-04-22) if rationale is needed.
-  No DECISIONS.md entry: rationale was not present during doc catch-up.
+- PK `user_id uuid` (FK `auth.users.id` ON DELETE CASCADE).
+- RLS: SELECT gated by `user_id = auth.uid()` — users can see their own row
+  (enough for the app to render "am I a sysadmin?" state). No write policies
+  from `authenticated`; bootstrap and ongoing management go through direct
+  SQL under the service role.
+- Membership is wrapped by `is_system_admin()` (House Rule 9) so downstream
+  RLS can check sysadmin status without recursing into this table's own RLS.
 
 ### `org_types`
 
-Lookup table for org classification. 3 canonical rows at time of writing.
+Lookup table for org classification. Global (not per-tenant), sysadmin-managed.
+Seeded with 3 rows (Contractor, Facility, Product/service provider).
 
-- PK `id bigint identity`. `name text` NOT NULL.
-- Referenced by `"org(s)".org_type_id` (NOT NULL since migration
-  `org_type_id_not_null`, 2026-04-22).
-- RLS: enabled. Policy pre-existing.
+- PK `id bigint identity`. `name text` NOT NULL UNIQUE.
+- Referenced by `"org(s)".org_type_id` (NOT NULL, ON DELETE RESTRICT).
+- **Trigger** `org_types_max_rows_trg` (BEFORE INSERT) rejects inserts once
+  the row count would exceed 10.
+- RLS: SELECT for any `authenticated` user; INSERT/UPDATE/DELETE gated by
+  `is_system_admin()`.
 
 ---
 

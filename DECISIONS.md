@@ -21,6 +21,28 @@ How to add new entries: see `UPDATING.md`.
 
 ---
 
+## 2026-04-22 — Org classification via sysadmin-managed global `org_types` catalog; exactly-one per org
+
+**Affects**: org_types, org(s).org_type_id, enforce_org_types_max_rows(), migrations `add_system_admins_and_org_types` + `org_type_id_not_null`
+**Decision**: `org_types` is a **global** (not per-tenant) lookup table keyed on `id bigint identity` with `name text NOT NULL UNIQUE`. Seeded with three rows: `Contractor`, `Facility`, `Product/service provider`. Capped at 10 rows via BEFORE INSERT trigger `org_types_max_rows_trg` → `enforce_org_types_max_rows()`. `"org(s)"` gains `org_type_id bigint NOT NULL` with FK to `org_types.id` `ON DELETE RESTRICT`. The two existing orgs (Acme Corp, TestCo) were backfilled to `Facility` before the NOT NULL was promoted (split across two migrations: add the nullable column + FK, backfill, then `org_type_id_not_null`). RLS on `org_types`: SELECT open to any `authenticated` user; INSERT / UPDATE / DELETE gated by `is_system_admin()`.
+**Why**: User framed the feature as "default org type configurable by the System Administrator only" and "every org must be one of these types" — that's a single source of truth managed outside the tenancy boundary, and a required single classification per org. Exactly-one cardinality (single FK column, not a join table) matches "must be one of" and keeps org-level queries trivial. Global scope (no `org_id` on `org_types`) matches "configurable by the System Administrator" — one admin, one list, not per-tenant customization. `ON DELETE RESTRICT` is the only FK action consistent with `NOT NULL`: `CASCADE` would delete orgs (catastrophic), `SET NULL` would violate the column constraint. The 10-row cap is enforced by a trigger because Postgres `CHECK` constraints are row-local and can't see `count(*)`; a trigger is the standard workaround and runs cheaply BEFORE INSERT.
+**Alternatives rejected**:
+- Per-tenant `org_types` (with `org_id` column): contradicts "sysadmin configures them" — there's one sysadmin and one list by user's framing.
+- Many-to-many tagging (join table, no direct column on `"org(s)"`): more flexible but rejected — user wants a primary classification, not a multi-tag. A junction can be added later without disturbing the required-primary column.
+- Leave `org_type_id` nullable indefinitely: user wanted every org to *have* a type; NOT NULL is the enforcement point.
+- Enforce the 10-row cap in app code only: bypassable by direct SQL and by any future admin tool; trigger makes the invariant authoritative.
+- `ON DELETE CASCADE` on the FK: would delete orgs when a sysadmin deletes a type — unacceptable blast radius.
+
+## 2026-04-22 — System admin role: dedicated `system_admins` table keyed on `user_id`
+
+**Affects**: system_admins, is_system_admin(), org_types RLS, House Rule 9, migration `add_system_admins_and_org_types`
+**Decision**: System administration is modeled as a dedicated table `system_admins` with `user_id uuid PRIMARY KEY` FK to `auth.users.id` `ON DELETE CASCADE`. The membership check is wrapped in a SECURITY DEFINER helper `is_system_admin()` (House Rule 9) so other tables' RLS can call it without recursing into `system_admins`'s own RLS. `system_admins` has a single RLS policy — SELECT gated by `user_id = auth.uid()` (a user can see their own row). No write policies for the `authenticated` role; the table is bootstrapped and maintained via direct SQL under the service role, making sysadmin elevation a deliberate out-of-band act.
+**Why**: "System Administrator" is cross-tenant by definition — a role that exists above the tenancy boundary. Representing it as a flag on `"Person(s)"` would couple the role to tenant membership, which inverts the semantic (sysadmins don't belong to an org; they manage across orgs). A dedicated table keeps the concept grep-able and visible in the schema. `is_system_admin()` mirrors `current_user_org()` — both are SECURITY DEFINER bypasses so RLS on dependent tables (`org_types` today; likely more later) doesn't have to reason about the admin table's own policies. Empty-by-default with no INSERT policy means no user can self-elevate through the app; bootstrapping the first sysadmin is always a conscious operator action.
+**Alternatives rejected**:
+- `is_system_admin boolean` on `"Person(s)"`: couples a cross-tenant role to tenant-scoped rows; a sysadmin would need a Person row in some arbitrary org, which misrepresents the scope.
+- Supabase custom JWT claim / service_role dependency: admin identity would live outside the schema (in auth config), breaking grep-ability and making audits harder. Also splits the "who is an admin" source of truth across two systems.
+- Allowing `authenticated` users to INSERT into `system_admins` (admins-grant-admins): would make elevation a runtime concern reachable through the normal auth path; the current model forces out-of-band action.
+
 ## 2026-04-22 — Solo-Entity per Person; Person(s) gets first/last/username
 
 **Affects**: Person(s), Entity(s), Entity(s)_members, House Rule 8, House Rule 9
