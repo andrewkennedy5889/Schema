@@ -417,6 +417,28 @@ Per-tenant custom display names for `table_registry` entries.
 
 - RLS: SELECT gated by `org_id = current_user_org()`.
 
+### `"swim_lane(s)"`
+
+Global, per-`org_type` functional lanes. Rule 17 moderated catalog.
+
+- Sysadmin-seeded with 9 placeholder lanes per org_type at deploy time
+  (`Lane 1..Lane 9`, `status='published'`). Rename via `UPDATE` as real
+  lane names are settled.
+- Tenant orgs may propose additional lanes via `INSERT` with
+  `status='proposed'`, stamping `proposed_by_org_id` +
+  `proposed_by_person_id`. Sysadmin publishes (sets `position`) or rejects
+  (records `rejection_reason`).
+- Partial unique indexes on `(org_type_id, name)` and
+  `(org_type_id, position)` scoped to `status='published'` — duplicates
+  allowed among proposed/rejected.
+- `position BETWEEN 1 AND 9` via CHECK; nullable for unslotted proposals.
+- RLS: `SELECT` published to all `authenticated`; proposer's org sees own
+  proposed/rejected; sysadmin sees all. `INSERT` via sysadmin OR
+  (status='proposed' AND proposed_by=current_user). `UPDATE`/`DELETE` via
+  `is_system_admin()`.
+- **Deferred**: `updated_at` trigger (`public.touch_updated_at`) not yet
+  wired — scheduled for a later cleanup migration.
+
 ---
 
 ## Tables — Group primitive

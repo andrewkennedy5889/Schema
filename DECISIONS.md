@@ -21,6 +21,18 @@ How to add new entries: see `UPDATING.md`.
 
 ---
 
+## 2026-04-23 — Swim-lane catalog: global, per-org-type, Rule-17 moderated
+
+**Affects**: `"03_metadata"."swim_lane(s)"` (new), Rule 17 usage, future FK targets on title / role / responsibility / workflow / process / node tables
+**Decision**: `"swim_lane(s)"` is a **global** moderated catalog keyed `bigint identity`, with `org_type_id` FK to `01_tenancy.org_types`. Follows Rule 17 lifecycle (`proposed | published | rejected`), superseding the `org_types`-style row-cap-trigger pattern. Seeded with 9 placeholder lanes (`Lane 1..Lane 9`, position 1..9) per existing org_type (27 rows total). Tenant orgs may **propose** new lanes via `INSERT` with `status='proposed'` and their own `proposed_by_org_id`/`proposed_by_person_id`; sysadmin publishes or rejects. Partial unique indexes on `(org_type_id, name)` and `(org_type_id, position)` scoped to `status='published'` cap the **published** set at 9 per org_type without blocking proposals. RLS: published visible to any authenticated; proposed/rejected visible to proposer's org + sysadmins; CUD gated by `is_system_admin()` except the tenant propose path.
+**Why**: User required "system-wide swim lanes, different for each of the 3 org_types" — global scope aligns with the `org_types` precedent of sysadmin-managed catalogs. Rule 17's propose/publish lifecycle was chosen over a hard `≤9 rows per org_type` trigger because (a) Rule 17 is the newer canonical pattern per SCHEMA.md, (b) hard caps block tenant input entirely whereas propose-flow surfaces tenant needs without handing out write authority, and (c) a partial unique index on `(org_type_id, position)` caps **published** lanes at 9 without preventing proposals from sitting in queue. Placeholders seeded over real names because the user will populate meaning iteratively. First of a 9-migration "Titles / Roles / Responsibilities / Tasks / Offerings" design arc (planning conversation 2026-04-23).
+**Alternatives rejected**:
+- Per-tenant `swim_lane(s)` with `org_id`: violates user framing of "system-wide"; fragments the catalog.
+- `org_types`-style max-9-rows trigger: outdated per Rule 17; blocks tenant-proposed lanes.
+- Seed real lane names at migration time: user explicitly chose placeholders to iterate later.
+- `NOT NULL position`: left nullable so unslotted proposals can exist before sysadmin assigns a slot on publish.
+- Attach `public.touch_updated_at` in this migration: deferred to preserve single-purpose atomicity.
+
 ## 2026-04-23 — Tenant overlay + marketed offerings in new `"12_overlay"` schema
 
 **Affects**: `"12_overlay"` schema (new), `"org_tag(s)"`, `"product_service_tag(s)"`, `"physical_item_tag(s)"`, `"org_offering(s)"` (all new), `enforce_product_service_tag_invariants()`, `enforce_physical_item_tag_invariants()`, Rule 16 schema map, migration `create_tenant_overlay_and_offerings`.
