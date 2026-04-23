@@ -499,6 +499,27 @@ Membership rows. Each row points to exactly one of: Person, Org, Div1..Div5.
   RLS gates via the parent entity's `org_id`, not the member's own.
 - RLS: full CRUD gated by `exists(select 1 from Entity(s) where id = entity_id and org_id = current_user_org())`.
 
+### `role_assignments`
+
+Direct role assignments — an Entity (solo-Entity for a Person, or a named
+group Entity) holds a `"06_templates"."role(s)"`. **Bundled-via-title
+assignments are NOT stored here** (Q18 derive-not-materialize); the
+`public.effective_roles` view (Migration 5) unions direct assignments with
+title-bundled roles.
+
+- PK `id uuid`. `org_id uuid` NOT NULL FK `"org(s)".id` `ON DELETE CASCADE`.
+- `role_id uuid` FK `"06_templates"."role(s)".id` `ON DELETE CASCADE`.
+- `entity_id uuid` FK `"Entity(s)".id` `ON DELETE CASCADE`.
+- `assigned_at timestamptz` NOT NULL; `revoked_at timestamptz` nullable
+  (Rule 6 soft delete). `revoke_reason text` nullable.
+- `assigned_by_person_id uuid` FK `"Person(s)".id`.
+- Partial UNIQUE `(role_id, entity_id) WHERE revoked_at IS NULL` —
+  at-most-one-active assignment per pair.
+- **Invariant trigger** `public.enforce_role_assignment_invariants`:
+  BEFORE INSERT/UPDATE of `(org_id, role_id, entity_id)` validates that
+  `role.org_id = entity.org_id = this.org_id` — same-tenant only.
+- RLS: full CRUD per Rule 10, gated on `org_id = current_user_org()`.
+
 ---
 
 ## Tables — Person contact layer (2 active + archived history)
