@@ -20,9 +20,34 @@ is the product. Lives in Supabase project `xffuegarpwigweuajkea`.
 Use the `supabase-schema-config` MCP:
 
 - `mcp__supabase-schema-config__list_tables` — current tables, columns, FKs.
+  **Default is `schemas: ["public"]`, which is empty of tables.** Always
+  pass the nine numbered schemas explicitly:
+  ```
+  ["01_tenancy","02_hierarchy","03_metadata","04_entities","05_contact",
+   "06_templates","07_runtime","08_moments","09_governance"]
+  ```
 - `mcp__supabase-schema-config__execute_sql` — ad-hoc read queries.
 - `mcp__supabase-schema-config__apply_migration` — DDL changes. Name migrations
   descriptively; the migration name is part of the decision record.
+
+### Session opener — set search_path once, write unqualified SQL
+
+Schema identifiers begin with digits so every qualified reference must be
+double-quoted (`"05_contact"."Person(s)_emails"`). To avoid that tax for the
+rest of the session, run this `execute_sql` once at the start:
+
+```sql
+SET search_path TO
+  "01_tenancy", "02_hierarchy", "03_metadata", "04_entities", "05_contact",
+  "06_templates", "07_runtime", "08_moments", "09_governance", public, pg_temp;
+```
+
+After that, `SELECT * FROM "Person(s)"` resolves to `"01_tenancy"."Person(s)"`
+with no ambiguity (all 45 table names are unique across schemas). Table-name
+quoting for parens is still required (`"Person(s)"`), but schema-name quoting
+is not. `apply_migration` runs each migration in its own session, so
+migrations themselves **must** use fully-qualified names — the session opener
+only helps ad-hoc `execute_sql` work.
 
 Per-column documentation lives in SQL `COMMENT ON`, not in markdown. Query
 `pg_description` or the verbose form of `list_tables` to see it. Do not
