@@ -345,6 +345,30 @@ A person within an org. May or may not have an `auth.users` login.
 - Cross-org visibility target for identity fields: tiered plan captured
   in PRD §10 but not yet enforced at column level — see deferred item in
   DECISIONS for the 2026-04-22 "Solo-Entity per Person" entry.
+- `title_id uuid` nullable, FK `"title(s)".id` `ON DELETE SET NULL` —
+  current title. One per Person at a time. Title is pure identity
+  (how the org refers to this Person); functional hats live on roles
+  bundled through the Title.
+
+### `"title(s)"`
+
+Per-org catalog of position/identity labels (e.g. "Regional Manager,"
+"Boston Branch Manager"). Title is pure identity; it bundles Roles via
+`title_roles` but carries no responsibilities directly.
+
+- `id uuid` (PK). `org_id uuid` FK `"org(s)".id` `ON DELETE CASCADE`.
+- `name text` NOT NULL, 1..120 chars. UNIQUE `(org_id, lower(name))
+  WHERE deleted_at IS NULL`.
+- `description text` nullable.
+- `declared_primary_swim_lane_id bigint` nullable, FK
+  `"03_metadata"."swim_lane(s)".id` `ON DELETE SET NULL` — the title's
+  primary functional lane. Must reference a swim_lane whose
+  `org_type_id` matches the title's org's `org_type_id` (validation
+  deferred to a cleanup migration; app-layer enforcement for now).
+- Soft delete via `deleted_at timestamptz`.
+- Audit: `created_at`, `updated_at` (trigger `public.touch_updated_at`),
+  `created_by_person_id`, `updated_by_person_id`.
+- RLS: full CRUD per Rule 10, gated on `org_id = current_user_org()`.
 
 ### `Div1`
 
