@@ -29,11 +29,14 @@ decision entry.
 
 ### 2. Naming: `"Person(s)"`-style parens on pluralized entity tables
 
-- `"org(s)"`, `"Person(s)"`, `"Entity(s)"`, `"Entity(s)_members"`, etc.
+- `"org(s)"`, `"Person(s)"`, `"Entity(s)"`, `"workflow(s)"`, `"moment_node(s)"`, etc.
 - `Div1..5` don't use parens — they're positional, not pluralized.
 - Sub-tables of a Person use `"Person(s)_<thing>"`: `"Person(s)_emails"`,
   `"Person(s)_phones"`, `"Person(s)_contact_shares"`,
   `"Person(s)_contact_share_delegations"`.
+- Joins, junctions, and log/audit tables are plain `snake_case` with no
+  parens: `workflow_template_processes`, `milestone_conditions`,
+  `status_change_log`, `moment_node_sources`.
 
 ### 3. Polymorphic FKs: multiple nullable columns + CHECK + partial unique indexes
 
@@ -44,6 +47,8 @@ decision entry.
 - Duplicate prevention: per-type partial unique indexes
   (`WHERE member_person_id IS NOT NULL` etc.). A single composite UNIQUE
   across all nullable columns does NOT work — Postgres treats NULLs as distinct.
+- See also Rule 12 for the thinner variant used on heterogeneous reference
+  columns (attests, decision justifications, etc.).
 
 ### 4. `org_id` means tenant; `member_*` prefix when an org is one role among many
 
@@ -59,6 +64,8 @@ decision entry.
 - `'org'` → same-org viewers (default).
 - `'shareable'` → same-org **and** anyone actively shared with.
 - Default is `'org'`. Sharing is opt-in per row.
+- Does NOT apply to attests — those use explicit ACL rows plus target-type
+  branching (see `"attest(s)"`).
 
 ### 6. Soft delete via `revoked_at timestamptz` nullable
 
@@ -67,6 +74,10 @@ decision entry.
 - `revoked_at IS NULL` = active. Non-null = revoked, with timestamp.
 - Uniqueness constraints on sharing tables use partial indexes filtering
   `WHERE revoked_at IS NULL`.
+- Soft-delete on user-facing entities (`"Person(s)"`, `"workflow_template(s)"`,
+  `"process_template(s)"`, `"workflow(s)"`, `"process(s)"`, `"node_template(s)"`,
+  `"policy(s)"`, `"evidence_node(s)"`) uses `deleted_at timestamptz` instead
+  — same semantics, different column name because these aren't share rows.
 
 ### 7. History via BEFORE UPDATE trigger, not generation columns
 
@@ -78,8 +89,9 @@ decision entry.
   - Max N active per owner enforced by partial unique index on
     `(owner_id, ordinal) WHERE status = 'active'`.
 - Do not archive via app code — the trigger is the single source of truth.
+- For single-record append-only data (evidence claims), see Rule 14.
 
-### 8. `Entity(s)` is the universal addressable-group primitive
+### 8. `Entity(s)` is the universal addressable-group primitive — every Person has a solo Entity
 
 - Any "group of mixed actors" (people, orgs, divs, or a mix) must use
   `Entity(s)` + `Entity(s)_members`.
@@ -88,10 +100,19 @@ decision entry.
   that wraps it — **not** adding direct `target_org_id` / `target_div*_id`
   columns.
 - Entities are **not** nestable (Entities do not contain other Entities).
+- **Solo-Entity pattern:** every `"Person(s)"` insert auto-creates a
+  1-member `"Entity(s)"` row (`solo_for_person_id = person.id`,
+  `name = person.username`) and an `"Entity(s)_members"` row binding them.
+  Entity name syncs on Person first/last name change. Cascades on Person
+  delete via `solo_for_person_id` FK.
+- Consequence: any "who" column downstream (role junctions, attest
+  generator, policy author, etc.) can FK to `"Entity(s)".id` uniformly
+  whether the referent is an individual or a group.
 
-### 9. RLS helper functions (all `SECURITY DEFINER`, `search_path = public`)
+### 9. RLS helper functions (all `SECURITY DEFINER`, `search_path = public, pg_temp`)
 
-- `current_user_org()` → viewer's tenant (pre-existing).
+- `current_user_org()` → viewer's tenant (pre-existing; re-declared in
+  phase_1_foundation_extensions to pin search_path).
 - `current_user_person_id()` → viewer's Person row.
 - `entities_current_user_is_member_of()` → set of Entity(s) IDs the viewer
   belongs to, via Person / org / Div1..5 paths.
@@ -99,15 +120,88 @@ decision entry.
   visibility predicate (self OR same-org-and-tier OR active-share-and-tier).
 - `current_user_can_share_for(owner)` → owner-or-active-delegate check,
   used by INSERT policy on shares.
+- `person_solo_entity_id(person_id)` → returns the solo-Entity id for the
+  given Person (see Rule 8).
 
 ### 10. Tenant-owned tables get full CRUD RLS; admin-managed tables get SELECT-only
 
-- Existing admin-managed tables (`Div1..5`, `Person(s)`) only expose SELECT
-  through `authenticated` — writes go through the service role.
-- User-created tables (`Entity(s)`, `Entity(s)_members`, contact rows,
-  shares, delegations) get full CRUD policies, gated to the owning tenant.
+- Admin-managed tables (`Div1..5`, `"Person(s)"`) only expose SELECT through
+  `authenticated` — writes go through the service role.
+- User-created tables (`"Entity(s)"`, `"Entity(s)_members"`, contact rows,
+  shares, delegations, the entire workflow/process/node/policy/evidence/attest
+  surface) get full CRUD policies, gated to the owning tenant.
 - When adding a new table, decide which class it belongs to before writing
   policies.
+
+### 11. `"moment_node(s)"` is LIST-partitioned; FKs into it carry the partition key
+
+- `"moment_node(s)"` is partitioned `BY LIST (node_type)` into four child
+  partitions (`_event`, `_action`, `_decision`, `_task`). Primary key is
+  composite `(id, node_type)` — Postgres requires the partition key in any
+  unique constraint on a partitioned table.
+- Any column pointing at a moment node must therefore carry a companion
+  `*_node_type` column alongside `*_node_id`, and the FK is composite:
+  `FOREIGN KEY (node_id, node_type) REFERENCES "moment_node(s)"(id, node_type)`.
+  Examples: `trigger_node_id / trigger_node_type`,
+  `decision_node_id / decision_node_type`, `task_node_id / task_node_type`,
+  `target_id / target_node_type` (when `target_kind = 'moment_node'`).
+- Partitions have RLS enabled individually (does NOT fully cascade from
+  the parent). Policies are declared on the parent; direct-to-partition
+  queries are deny-by-default, which is the intended safety net.
+
+### 12. Polymorphic target refs: `target_kind` + `target_id` (+ companion when partitioned)
+
+- Thinner variant of Rule 3 for tables that hold heterogeneous references
+  (attests, decision justifications, policy supporting evidence, attest
+  visibility, status change log).
+- Pattern: `target_kind text` with an explicit CHECK list of allowed
+  kinds, `target_id uuid` holding the referent's primary key, and — when
+  `target_kind` resolves to a partitioned table — a `target_node_type`
+  companion per Rule 11.
+- FK integrity is application-layer, not database. No single FK can point
+  at multiple parent tables. Violations surface via test coverage and
+  occasional SQL audits.
+- Use Rule 3 (fan-out with per-type FKs) when target-type membership is
+  small and stable and FK integrity matters (e.g. `"Entity(s)_members"`).
+  Use Rule 12 when the target set is wider and the app layer can be
+  trusted to enforce the reference.
+
+### 13. Template + Instance split for reusable flows
+
+- Three pairs: `"workflow_template(s)"` ↔ `"workflow(s)"`,
+  `"process_template(s)"` ↔ `"process(s)"`,
+  `"node_template(s)"` ↔ `"moment_node(s)"`.
+- Templates compose many-to-many at their level
+  (`workflow_template_processes` junction). Instances are owned
+  one-to-many — `process(s).workflow_id` FK, not a junction.
+- Materialization is **copy on spawn**, not live reference. Editing a
+  template does NOT retroactively change already-spawned instances.
+  `"moment_node(s)".spawned_from_template_id` is an audit link, not a
+  live config dependency.
+- Spawning policy: non-conditional node templates are spawned eagerly
+  (`moment_nodes` row created when the process instance is created).
+  Conditional node templates are spawned lazily — row appears only when
+  the trigger+condition actually fires.
+
+### 14. Append-only via BEFORE UPDATE trigger
+
+- Applied to `"evidence_property(s)"`. A BEFORE UPDATE trigger rejects
+  changes to any value column; only `superseded_by_id` and `superseded_at`
+  may be UPDATEd on an existing row.
+- New values are inserted as new rows; the old row's `superseded_by_id`
+  is set to point at the replacement.
+- Queries for "current" values filter `WHERE superseded_by_id IS NULL`.
+- Contrast with Rule 7 (N-active-with-archive trigger): that pattern is
+  for multi-slot content (emails, phones) where both old and new values
+  have meaningful slot semantics. Rule 14 is for single-record claims
+  whose value must remain citeable as-was.
+
+### 15. `obligation_kind` ENUM shared between Policy and Task options
+
+- `CREATE TYPE obligation_kind AS ENUM ('recommended','mandatory','prohibitive')`.
+- Used by `"policy(s)".kind` and `task_prescription_options.obligation`.
+  Do not recreate this as per-table CHECK constraints — edit the ENUM in
+  one place.
 
 ---
 
@@ -121,6 +215,8 @@ Root tenant table. Every other tenant-owned row points back here.
 - `active_div_levels smallint` (1–5, default 5, CHECK-constrained) — how
   many Div levels this tenant uses. UI and validation respect this.
 - `slug text` unique, nullable — tenant URL slug.
+- `org_type_id bigint` NOT NULL, FK `org_types.id` — classification of
+  the tenant (see `org_types` below).
 - RLS: enabled. Policy set not yet audited here (pre-existing from initial setup).
 
 ### `"Person(s)"`
@@ -132,8 +228,22 @@ A person within an org. May or may not have an `auth.users` login.
 - `"Person's_org" uuid` (default `auth.uid()`) — tenant link. Quirky legacy
   column name; keep exactly as-is.
 - `div1_id..div5_id bigint` nullable — Div-tier placement.
+- `first_name text` NOT NULL, `last_name text` NOT NULL — real human name
+  parts. No uniqueness — name collisions are expected and allowed.
+- `username text GENERATED ALWAYS AS (first_name || ' ' || last_name) STORED` —
+  display handle; NEVER written directly.
+- `is_active boolean` NOT NULL default `true`; `deactivated_at timestamptz`
+  nullable; `deleted_at timestamptz` nullable (soft delete).
+- `updated_at timestamptz` (trigger-maintained), plus
+  `created_by_person_id` / `updated_by_person_id` audit FKs.
+- **Trigger:** `AFTER INSERT` → auto-create solo `"Entity(s)"` row (see
+  Rule 8). `AFTER UPDATE OF first_name, last_name` → sync solo Entity's
+  `name` to new username.
 - RLS: SELECT only, gated by `"Person's_org" = current_user_org()`.
   Writes go through service role.
+- Cross-org visibility target for identity fields: tiered plan captured
+  in PRD §10 but not yet enforced at column level — see deferred item in
+  DECISIONS for the 2026-04-22 "Solo-Entity per Person" entry.
 
 ### `Div1`
 
@@ -146,6 +256,29 @@ Top of the 5-level tenant-internal hierarchy.
 
 Chained below `Div1` via `parent_id`. RLS traces the parent chain up to
 `Div1.org_id` to check tenancy.
+
+---
+
+## Tables — System admin + org typing
+
+### `system_admins`
+
+Cross-tenant privileged role. A user listed here has system-admin access
+regardless of tenant. Intentionally has no `org_id` — scope is global.
+
+- PK `user_id uuid` (FK `auth.users.id`).
+- RLS: enabled. Policy set pre-existing; not captured here — see migration
+  `add_system_admins_and_org_types` (2026-04-22) if rationale is needed.
+  No DECISIONS.md entry: rationale was not present during doc catch-up.
+
+### `org_types`
+
+Lookup table for org classification. 3 canonical rows at time of writing.
+
+- PK `id bigint identity`. `name text` NOT NULL.
+- Referenced by `"org(s)".org_type_id` (NOT NULL since migration
+  `org_type_id_not_null`, 2026-04-22).
+- RLS: enabled. Policy pre-existing.
 
 ---
 
@@ -179,6 +312,10 @@ Tenant-scoped custom-named grouping. Membership is polymorphic and lives in
 - `name text` NOT NULL. UNIQUE `(org_id, name)` — dup names allowed across
   tenants, blocked within one.
 - `description text` optional.
+- `solo_for_person_id uuid` nullable, FK `"Person(s)".id` ON DELETE CASCADE
+  — non-null only on solo Entities auto-created per Person (see Rule 8).
+  Partial UNIQUE `(solo_for_person_id) WHERE solo_for_person_id IS NOT NULL`
+  enforces at-most-one solo Entity per Person.
 - Entities cannot nest (by decision — see `DECISIONS.md`).
 - RLS: full CRUD gated by `org_id = current_user_org()`.
 
@@ -261,3 +398,346 @@ Authorizes a Person or Entity to create shares of the owner's contact.
   sharer and this owner was the owner. Owner's own shares untouched.
 - RLS: SELECT visible to owner, delegate Person, and members of delegate
   Entity. Only owner can INSERT/UPDATE/DELETE.
+
+---
+
+## Tables — Workflow / Process containers
+
+### `"workflow_template(s)"`
+
+Reusable workflow blueprint. Composes process templates many-to-many.
+
+- PK `id uuid`. `org_id uuid` NOT NULL. `name text` NOT NULL.
+- Standard audit block + soft-delete `deleted_at`.
+- RLS: full CRUD gated by `org_id = current_user_org()`.
+
+### `"process_template(s)"`
+
+Reusable process blueprint. Contains node templates (per Rule 13) and
+milestones (`process_template_milestones`).
+
+- PK `id uuid`. `org_id uuid` NOT NULL. `name text` NOT NULL.
+- Standard audit block + soft-delete.
+- RLS: full CRUD gated by `org_id = current_user_org()`.
+
+### `workflow_template_processes`
+
+M:N composition of process templates into workflow templates.
+
+- `workflow_template_id uuid` ON DELETE CASCADE; `process_template_id uuid`
+  (no cascade — process templates are library items, not workflow-owned).
+  `position int` for ordering in the workflow.
+- UNIQUE `(workflow_template_id, process_template_id)`.
+- RLS: gated via parent workflow_template's org_id.
+
+### `"workflow(s)"`
+
+Workflow instance.
+
+- PK `id uuid`. `template_id` FK. `status text` CHECK IN
+  `('active','partially_complete','completed','cancelled')`.
+- `generated_by_person_id uuid` — who spawned it (workflows are
+  person-spawned only; nodes do not spawn workflows).
+- Standard audit block + soft-delete.
+- **Trigger:** `AFTER INSERT OR UPDATE OF status OR DELETE ON "process(s)"`
+  auto-recomputes the parent workflow's `status`:
+  all-completed → `completed`; all-cancelled → `cancelled`;
+  any-completed-but-not-all → `partially_complete`; otherwise `active`.
+  Manual `cancelled` is respected (not overwritten).
+- Status transitions logged to `status_change_log`.
+- RLS: full CRUD gated by `org_id = current_user_org()`.
+
+### `"process(s)"`
+
+Process instance.
+
+- PK `id uuid`. `template_id`, `workflow_id` FKs. `status text` CHECK IN
+  `('draft','active','paused','completed','cancelled','failed')`.
+- Generation source: exactly one of `generated_by_person_id` (manual
+  spawn) OR `generated_by_node_id` + `generated_by_node_type` (auto-spawn
+  from a moment node). CHECK `num_nonnulls(generated_by_person_id, generated_by_node_id) = 1`.
+- Standard audit block + soft-delete.
+- Status transitions logged to `status_change_log`.
+- RLS: full CRUD gated by `org_id = current_user_org()`.
+
+---
+
+## Tables — Nodes (templates + instances)
+
+### `"node_template(s)"`
+
+Node-level blueprint within a process template. Mirrors the shape of
+`"moment_node(s)"` but holds default/template values, not time-stamped data.
+
+- PK `id uuid`. `org_id uuid` NOT NULL. `process_template_id uuid`
+  NOT NULL ON DELETE CASCADE.
+- `node_type text` CHECK IN `('event','action','decision','task')`.
+- `is_conditional boolean` + `trigger_condition_text text` (CHECK:
+  conditional rows must have condition text).
+- Task-only defaults: `obligation obligation_kind`, `due_date_offset interval`.
+- Event-only: `event_subtype text`.
+- Standard audit block + soft-delete.
+- RLS: full CRUD gated by `org_id = current_user_org()`.
+
+### `process_template_node_edges`
+
+DAG edges between node templates within a process template. Encodes the
+flow structure (triggers, spawns-on-resolution, depends-on).
+
+- `from_node_template_id`, `to_node_template_id` both FK to
+  `"node_template(s)"` ON DELETE CASCADE.
+- `edge_kind text` CHECK IN `('triggers','spawns_on_resolution','depends_on')`.
+- `condition_text text` optional.
+- UNIQUE `(from_node_template_id, to_node_template_id, edge_kind)`.
+- RLS: gated via from-node's org_id.
+
+### `"moment_node(s)"` — partitioned
+
+The hot table. See Rule 11 for partitioning mechanics. Tens of millions of
+rows per tenant at scale.
+
+- Composite PK `(id, node_type)`. Partitions: `"moment_node(s)_event"`,
+  `_action`, `_decision`, `_task`.
+- `org_id uuid` NOT NULL. `process_id uuid` nullable (orphan nodes
+  allowed, though unusual). `spawned_from_template_id uuid` nullable
+  (ad-hoc nodes allowed).
+- `trigger_timestamp timestamptz` NOT NULL — when the moment occurred.
+- Trigger relation: `trigger_node_id uuid` + `trigger_node_type text`
+  (composite companion per Rule 11), nullable pair; CHECK requires both
+  or neither.
+- `status text` with per-`node_type` CHECK:
+  - Event: `recorded`
+  - Action: `executed | aborted`
+  - Decision: `pending | resolved | reversed`
+  - Task: `latent | active | completed | cancelled | superseded`
+- Type-specific columns, each CHECK-gated to its node_type:
+  `decision_timestamp`, `justification_note`, `due_date`, `obligation`,
+  `is_conditional`, `trigger_condition_text` (task-only),
+  `action_timestamp`, `event_subtype`.
+- Standard audit block. **Not** soft-deleted (immutable audit record).
+- Status transitions logged to `status_change_log`.
+- RLS enabled on parent AND each partition. Policies declared on parent;
+  direct-to-partition queries are deny-by-default (intended safety net).
+
+---
+
+## Tables — Node role junctions
+
+Three parallel junctions for the A.1 roles. Each has identical shape; they
+are separate tables rather than one unified junction with a role discriminator.
+
+### `moment_node_sources`, `moment_node_owners`, `moment_node_affected`
+
+- `moment_node_id uuid`, `moment_node_type text`, composite FK to
+  `"moment_node(s)"(id, node_type)` ON DELETE CASCADE.
+- `entity_id uuid` NOT NULL FK `"Entity(s)".id` — Entity-only targets
+  (Persons go via solo Entity, per Rule 8).
+- UNIQUE `(moment_node_id, moment_node_type, entity_id)`.
+- Non-empty invariant (≥1 row per role per node) is **app-layer** for
+  now — no deferred constraint trigger installed yet.
+- RLS: full CRUD gated via parent moment_node's org_id.
+
+---
+
+## Tables — Policy & Evidence
+
+### `"policy(s)"`
+
+Authored rule, referenced by Decisions for justification and by Task
+prescription options as backing.
+
+- PK `id uuid`. `org_id uuid` NOT NULL. `name text` NOT NULL.
+- `kind obligation_kind` NOT NULL (see Rule 15).
+- `author_entity_id uuid` NOT NULL FK `"Entity(s)".id` — individual OR
+  group author (committees are legitimate authors).
+- Standard audit block + soft-delete.
+- RLS: full CRUD gated by `org_id = current_user_org()`.
+
+### `"evidence_node(s)"`
+
+External citation reference (document, database row, trigger output).
+Metadata is editable in place.
+
+- PK `id uuid`. `org_id uuid` NOT NULL.
+- `source_type text` CHECK IN `('document','database','trigger')`.
+- `validity_kind text` CHECK IN
+  `('permanent','point_in_time','live_query','trigger_snapshot')` —
+  governs how the cited source relates to time.
+- `storage_uri text`, `content_hash text` — provenance pointers
+  (Supabase Storage integration deferred).
+- Standard audit block + soft-delete.
+- RLS: full CRUD gated by `org_id = current_user_org()`.
+
+### `"evidence_property(s)"` — append-only, see Rule 14
+
+Specific claim extracted from an evidence node. Rows are immutable once
+inserted, except for `superseded_by_id` / `superseded_at` which form a
+replacement chain.
+
+- PK `id uuid`. `org_id uuid` NOT NULL. `evidence_node_id uuid` FK.
+- `property_name text`, `property_value text`, `value_captured_at timestamptz`.
+- `superseded_by_id uuid` self-FK, `superseded_at timestamptz`.
+- **Trigger** `evidence_property_enforce_append_only` (BEFORE UPDATE)
+  rejects any UPDATE that touches value/name/captured_at/org/node columns.
+- Queries for current values filter `WHERE superseded_by_id IS NULL`.
+- Partial index `(evidence_node_id, property_name) WHERE superseded_by_id IS NULL`.
+- RLS: full CRUD gated by `org_id = current_user_org()`. UPDATE is
+  app-permitted but trigger-restricted to supersession columns only.
+
+### `policy_supporting_evidence`
+
+Polymorphic junction linking a policy to its backing evidence.
+
+- `policy_id uuid` FK ON DELETE CASCADE.
+- `target_kind text` CHECK IN `('evidence_node','evidence_property')` —
+  Rule 12 variant.
+- `target_id uuid`. FK integrity app-layer (see Rule 12).
+- `note text` optional.
+- RLS: gated via parent policy's org_id.
+
+---
+
+## Tables — Task prescription + Decision justification
+
+### `task_prescription_options`
+
+The option menu on a Task node. Each row is a candidate action;
+per-option Policies back them.
+
+- `task_node_id uuid` + `task_node_type text` (composite FK, Rule 11),
+  CHECK `task_node_type = 'task'`.
+- `label text` NOT NULL. `obligation obligation_kind` NOT NULL (Rule 15).
+- `is_conditional boolean` + `condition_text text` (CHECK pair).
+- `policy_id uuid` optional — Policy backing this specific option.
+- `position int` — order within the set.
+- Standard audit block.
+- RLS: full CRUD gated by `org_id = current_user_org()`.
+
+### `decision_justifications`
+
+Polymorphic multi-ref from a Decision to its basis (moment nodes, policies,
+evidence nodes, evidence properties, processes).
+
+- `decision_node_id uuid` + `decision_node_type text` (composite FK),
+  CHECK `decision_node_type = 'decision'`.
+- `target_kind text` CHECK IN
+  `('moment_node','policy','evidence_node','evidence_property','process')`.
+- `target_id uuid`. When `target_kind = 'moment_node'`, `target_node_type`
+  is required.
+- `note text` optional free-text.
+- RLS: gated via parent Decision's org_id.
+
+---
+
+## Tables — Milestones
+
+Process-level waypoints, fired when a logical condition over child node
+statuses is satisfied.
+
+### `process_template_milestones`
+
+Definition. Flat AND/OR logic per Rule 13's referenced pattern.
+
+- `process_template_id uuid` FK ON DELETE CASCADE.
+- `name text`, `position int`.
+- `logic_op text` CHECK IN `('AND','OR')` — governs how `milestone_conditions`
+  combine.
+- `notify_entity_ids uuid[]` — who to notify when this milestone fires.
+- RLS: gated via parent process_template's org_id.
+
+### `milestone_conditions`
+
+Conditions on a milestone. Each row names a node template and a required
+status; `logic_op` on the milestone combines them.
+
+- `milestone_id uuid` FK ON DELETE CASCADE.
+- `node_template_id uuid` FK.
+- `required_status text`.
+- `position int`.
+- RLS: gated via milestone → template → org.
+
+### `process_milestone_hits`
+
+Log rows, created when an instance hits a milestone.
+
+- `process_id uuid` FK ON DELETE CASCADE. `milestone_id uuid` FK.
+- `hit_at timestamptz` default now.
+- `triggered_by_node_id`, `triggered_by_node_type` — which node's status
+  change tripped the milestone.
+- UNIQUE `(process_id, milestone_id)` — one hit per milestone per instance.
+- RLS: gated via parent process's org_id.
+
+---
+
+## Tables — Attests + comments + visibility
+
+### `"attest(s)"`
+
+Polymorphic endorsement / reaction / vouch. One table for likes, approvals,
+sign-offs, fact-affirmations — the data shape is identical across weights.
+
+- PK `id uuid`. `org_id uuid` NOT NULL.
+- `generator_person_id uuid` NOT NULL FK `"Person(s)".id` — Person only,
+  not Entity. Individual accountability.
+- `polarity text` CHECK IN `('positive','negative','neutral')`.
+- `basis text` CHECK IN `('fact','opinion')`.
+- `comment text` optional.
+- Polymorphic target (Rule 12): `target_kind text` CHECK IN
+  `('person','moment_node','process','policy','evidence_node','evidence_property')`,
+  `target_id uuid`, `target_node_type text` (required when
+  `target_kind = 'moment_node'`).
+- `process_id uuid` optional — if the attest was made in the context of
+  a specific process run.
+- Time window: `attest_start`, `attest_end` both nullable (NULL = no bound).
+- `revoked_at timestamptz` nullable — soft-revoke.
+- **RLS: target-branched.** SELECT allowed when `target_kind = 'person'`
+  (cross-org visible, for the "vouch for a real person / phone / email"
+  pattern), OR `org_id = current_user_org()`, OR current user is in the
+  `attest_visibility` ACL. INSERT/UPDATE/DELETE scoped to generator within
+  their own org.
+
+### `attest_comments`
+
+Threaded discussion on an attest. Flat (no parent_comment_id yet).
+
+- `attest_id uuid` FK ON DELETE CASCADE.
+- `commenter_entity_id uuid` NOT NULL — Entity (groups can reply, per Rule 8).
+- `comment_text text`. Standard audit columns.
+- RLS: gated via parent attest; inherits the target-branched visibility.
+
+### `attest_visibility`
+
+Explicit ACL widening an attest's visibility. Empty ACL = default visibility
+(org-scoped or cross-org per target_kind).
+
+- `attest_id uuid` FK ON DELETE CASCADE.
+- `visibility_kind text` CHECK IN `('person','entity','org')`.
+- Exactly one of `person_id`, `entity_id`, `org_id` populated, matching
+  `visibility_kind`. CHECK enforced via `num_nonnulls = 1` + matching
+  kind constraint.
+- Cross-org grants (`org_id`) let an attest be read by a user in another
+  tenant. This is the first deliberate cross-tenant read path outside
+  `"Entity(s)_members"`.
+- RLS: gated via parent attest's org_id.
+
+---
+
+## Tables — Audit log
+
+### `status_change_log`
+
+Generic log of status transitions on workflow / process / moment_node.
+Populated by AFTER UPDATE triggers on each source table.
+
+- `entity_kind text` CHECK IN `('workflow','process','moment_node')`.
+- `entity_id uuid`, `entity_node_type text` (populated for moment_node
+  entries per Rule 11).
+- `old_status text`, `new_status text`.
+- `changed_by_person_id uuid` — resolved via
+  `(SELECT id FROM "Person(s)" WHERE user_id = auth.uid())` in each
+  logger trigger.
+- `changed_at timestamptz` default now. `reason text` optional.
+- **No user INSERT policy** — only the triggers write to this table;
+  direct writes from `authenticated` role are not permitted.
+- SELECT RLS: branched by `entity_kind`, each branch gated via the
+  parent entity's `org_id`.
