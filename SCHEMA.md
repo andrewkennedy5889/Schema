@@ -249,6 +249,48 @@ decision entry.
 - Supabase Data API (PostgREST) must have all 9 schemas listed under
   Project Settings → Data API → **Exposed schemas** for client access.
 
+### 17. Moderated seeded catalogs — `status` lifecycle replaces hard row caps
+
+- Global lookup tables that need a curated starter set but also organic
+  growth ship with a sysadmin-authored seed set at `status='published'` and
+  grow via the `proposed → published | rejected` lifecycle. Replaces the
+  older "hard cap + trigger" pattern (e.g. `org_types_max_rows_trg`, dropped
+  2026-04-23).
+- **Columns** (on every table under this rule):
+  - `status text NOT NULL CHECK IN ('proposed','published','rejected')`,
+    DEFAULT `'proposed'` so user-authored rows start as proposals.
+  - `proposed_by_org_id uuid NULL` + `proposed_by_person_id uuid NULL` —
+    authorship. Both NULL on sysadmin-seeded rows.
+  - `published_at timestamptz NULL`, `rejected_at timestamptz NULL`,
+    `rejection_reason text NULL`. A status/date CHECK enforces that the
+    timestamps match the status claim (published rows have `published_at`
+    non-null and `rejected_at` null; rejected rows have `rejected_at`
+    non-null; proposed rows have both null).
+- **RLS pattern**:
+  - SELECT: `status='published'` visible to all `authenticated`; `'proposed'`
+    and `'rejected'` visible only to the proposer's org members
+    (`current_user_org() = proposed_by_org_id`) and sysadmins.
+  - INSERT: any authenticated user may submit a `'proposed'` row
+    authored by their own org (no direct-to-published); sysadmin escape
+    hatch bypasses the check for seeding and direct curation.
+  - UPDATE / DELETE: sysadmin only. Moderation transitions
+    (proposed → published, proposed → rejected) happen through UPDATE.
+- **Dual-reference tag pattern** — for any junction that attaches user data
+  to a lookup row which may still be in moderation: the tag row carries both
+  `{value}_id` (author's intent, may be `'proposed'`) AND
+  `fallback_{value}_id` (required when `{value}_id.status='proposed'`; must
+  reference a `'published'` row). Display resolves to `{value}_id` if its
+  status is `'published'`, else to `fallback_{value}_id`. Approval of a
+  proposed value automatically promotes every tag referencing it platform-
+  wide; rejection falls back cleanly to the published fallback.
+- **Seeding**: tables under this rule are seeded in the same migration that
+  creates them, with `status='published'`, `published_at=now()`,
+  `proposed_by_org_id=NULL`.
+- Tables under this rule: `org_types` (first adopter, 2026-04-23).
+  Product/service categories, problem categories, problem dimensions +
+  values, and physical-item categories at each level all adopt this pattern
+  as they land.
+
 ---
 
 ## Tables — Tenancy layer
@@ -327,15 +369,26 @@ regardless of tenant. Intentionally has no `org_id` — scope is global.
 
 ### `org_types`
 
-Lookup table for org classification. Global (not per-tenant), sysadmin-managed.
-Seeded with 3 rows (Contractor, Facility, Product/service provider).
+Lookup table for org classification. Global (not per-tenant). Seeded with
+3 rows (Contractor, Facility, Product/service provider). First adopter of
+House Rule 17 (moderated seeded catalogs).
 
 - PK `id bigint identity`. `name text` NOT NULL UNIQUE.
 - Referenced by `"org(s)".org_type_id` (NOT NULL, ON DELETE RESTRICT).
-- **Trigger** `org_types_max_rows_trg` (BEFORE INSERT) rejects inserts once
-  the row count would exceed 10.
-- RLS: SELECT for any `authenticated` user; INSERT/UPDATE/DELETE gated by
-  `is_system_admin()`.
+- **Rule 17 lifecycle columns**: `status`, `proposed_by_org_id`,
+  `proposed_by_person_id`, `published_at`, `rejected_at`, `rejection_reason`
+  + `org_types_status_dates_chk` consistency CHECK. See Rule 17 for
+  semantics. Default `status` is `'proposed'` (so new user-authored rows
+  enter moderation); seeded rows were backfilled to `'published'` with
+  `published_at = created_at`.
+- **No row cap.** The prior `org_types_max_rows_trg` (hard cap of 10) and
+  its helper `enforce_org_types_max_rows()` were dropped 2026-04-23 when
+  this table migrated to Rule 17. Governance is now lifecycle-based, not
+  numeric.
+- **RLS**: published rows globally visible to `authenticated`; proposed /
+  rejected rows visible to the proposer's org members and sysadmins.
+  INSERT allows any authenticated user to submit a `'proposed'` row scoped
+  to their own `current_user_org()`. UPDATE / DELETE are sysadmin-only.
 
 ---
 
