@@ -222,8 +222,8 @@ decision entry.
 
 ### 16. Tables live in 9 numbered grouping schemas; `public` holds only helpers
 
-- The 45 tables are distributed across nine schemas whose names start with
-  a two-digit prefix. Schema identifiers must be double-quoted at every
+- Tables are distributed across twelve numbered schemas whose names start
+  with a two-digit prefix. Schema identifiers must be double-quoted at every
   reference site (`"05_contact"."Person(s)_emails"`).
 
   | Schema | Contents |
@@ -233,21 +233,29 @@ decision entry.
   | `"03_metadata"` | `table_registry`, `table_nicknames` |
   | `"04_entities"` | `"Entity(s)"`, `"Entity(s)_members"` |
   | `"05_contact"` | `"Person(s)_emails"`, `"Person(s)_phones"`, `"Person(s)_employment_history"`, `"Person(s)_notes"`, `"Person(s)_note_shares"`, `"Person(s)_contact_shares"`, `"Person(s)_contact_share_delegations"` |
-  | `"06_templates"` | `"workflow_template(s)"`, `"process_template(s)"`, `workflow_template_processes`, `"node_template(s)"`, `process_template_node_edges`, `process_template_milestones`, `milestone_conditions`, `task_prescription_options` |
+  | `"06_templates"` | `"workflow_template(s)"`, `"process_template(s)"`, `workflow_template_processes`, `"node_template(s)"`, `process_template_node_edges`, `process_template_milestones`, `milestone_conditions`, `task_prescription_options`, `process_template_problems`, `"node_template_physical_requirement(s)"` |
   | `"07_runtime"` | `"workflow(s)"`, `"process(s)"`, `status_change_log`, `process_milestone_hits` |
   | `"08_moments"` | `"moment_node(s)"` (partitioned) + 4 subtype partitions + `moment_node_sources`/`_owners`/`_affected`, `decision_justifications` |
   | `"09_governance"` | `"policy(s)"`, `"evidence_node(s)"`, `"evidence_property(s)"`, `policy_supporting_evidence`, `"attest(s)"`, `attest_comments`, `attest_visibility` |
+  | `"10_catalog"` | `"product_service(s)"`, `product_service_categories`, `"product_service_category_tag(s)"`, `"problem(s)"`, `problem_categories`, `"problem_category_tag(s)"`, `problem_dimensions`, `problem_dimension_values`, `"problem_dimension_tag(s)"`, `"problem_case(s)"`, `problem_case_solutions`, `problem_case_ratings` |
+  | `"11_physical"` | `physical_item_categories`, `physical_item_l1_subcategories`, `"physical_item(s)"`, `"physical_item_attachment(s)"`, `"physical_item_property(s)"`, `"physical_item_assignment(s)"` |
+  | `"12_overlay"` | `"org_tag(s)"`, `"product_service_tag(s)"`, `"physical_item_tag(s)"`, `"org_offering(s)"` |
 
-- `public` keeps all 22 helper/trigger functions. Function `search_path` is
-  widened to include all 9 schemas plus `public, pg_temp`, so unqualified
-  table references inside function bodies continue to resolve. Functions
-  with hard-coded `public.<table>` references were rewritten to point at
-  the new schema locations.
+- `public` keeps all helper/trigger functions. Function `search_path` is
+  widened to include all numbered schemas plus `public, pg_temp`, so
+  unqualified table references inside function bodies continue to resolve.
+  Functions with hard-coded `public.<table>` references were rewritten to
+  point at the new schema locations. New helpers (post-phases-2-to-8) use
+  `SECURITY DEFINER` with an explicit `SET search_path` listing only the
+  schemas they touch.
 - When adding a new table, pick its schema by domain fit. If ambiguous,
   re-read the 2026-04-22 "Tenant DB reorganized into 9 numbered schemas"
   DECISIONS entry.
-- Supabase Data API (PostgREST) must have all 9 schemas listed under
+- **Supabase Data API exposure**: all twelve schemas must be listed under
   Project Settings → Data API → **Exposed schemas** for client access.
+  Schemas `"10_catalog"`, `"11_physical"`, and `"12_overlay"` were added
+  2026-04-23 and need to be added to the Data API exposed list as a
+  manual config step outside of SQL migrations.
 
 ### 17. Moderated seeded catalogs — `status` lifecycle replaces hard row caps
 
@@ -913,3 +921,374 @@ Populated by AFTER UPDATE triggers on each source table.
   direct writes from `authenticated` role are not permitted.
 - SELECT RLS: branched by `entity_kind`, each branch gated via the
   parent entity's `org_id`.
+
+---
+
+## Tables — Catalog layer (`"10_catalog"`)
+
+Global cross-tenant catalog of products, services, and problems.
+Two-layer model: the catalog row itself is global (and moderated via
+Rule 17), while the per-org implementation (recipes) lives in
+`"06_templates"."process_template(s)"` keyed by `product_service_id`.
+
+### `"product_service(s)"`
+
+Global catalog of products and services — one table with `kind`
+discriminator (`product` | `service`), not Postgres-partitioned (catalog
+stays small, <10k rows per tenant-equivalent).
+
+- PK `id uuid`. `kind text CHECK IN ('product','service')`. `name text`
+  NOT NULL, `description text`.
+- Rule 17 lifecycle columns (`status`, `proposed_by_org_id`,
+  `proposed_by_person_id`, `published_at`, `rejected_at`, `rejection_reason`)
+  + `product_service_status_dates_chk`.
+- Standard audit block (`created_at`, `updated_at`,
+  `created_by_person_id`, `updated_by_person_id`). `updated_at` maintained
+  by `public.touch_updated_at()` BEFORE UPDATE trigger.
+- Partial UNIQUE `(kind, lower(name)) WHERE status = 'published'` — dup
+  names allowed only during moderation.
+- RLS per Rule 17.
+
+### `product_service_categories`
+
+Global category taxonomy for catalog rows. Separate logical lists per
+`kind` (product vs service).
+
+- PK `id bigint identity`. `kind text CHECK IN ('product','service')`.
+  `name text` NOT NULL.
+- Rule 17 lifecycle columns + `product_service_categories_status_dates_chk`.
+- Partial UNIQUE `(kind, lower(name)) WHERE status = 'published'`.
+- Seeded with 10 rows at migration: 5 product + 5 service starter
+  categories (all `status='published'`, `proposed_by_org_id = NULL`).
+- RLS per Rule 17.
+
+### `"product_service_category_tag(s)"`
+
+Junction tagging catalog rows with categories. Rule 17 dual-reference
+pattern: `fallback_category_id` is required when `category_id` is still
+`'proposed'` and must reference a `'published'` row.
+
+- `product_service_id` FK ON DELETE CASCADE.
+- `category_id` FK (intent), `fallback_category_id` FK (display fallback
+  while pending). UNIQUE `(product_service_id, category_id)`.
+- `tagged_by_org_id`, `tagged_by_person_id` — authorship of the tag
+  (distinct from the catalog row's authorship).
+- Trigger `product_service_category_tag_dual_ref_chk` enforces Rule 17
+  dual-reference invariants via `public.enforce_rule17_dual_ref_ps_category()`.
+- RLS: SELECT open to all authenticated (tags on public rows are public);
+  INSERT / UPDATE / DELETE gated by `tagged_by_org_id = current_user_org()`.
+
+### `"problem(s)"`
+
+Canonical problem taxonomy. Sysadmin-curated via Rule 17 (anyone proposes,
+sysadmin publishes). Each problem has:
+
+- PK `id uuid`. `name text` NOT NULL, `description text`.
+- Rule 17 lifecycle columns + `problem_status_dates_chk`.
+- `updated_at` via `public.touch_updated_at()` trigger.
+- Partial UNIQUE `(lower(name)) WHERE status = 'published'`.
+- RLS per Rule 17.
+
+Problems relate via multi-dimensional facets (see `problem_dimensions`)
+rather than a single category tree. Case studies live in
+`"problem_case(s)"`; recipes that target a problem link through
+`"06_templates".process_template_problems`.
+
+### `problem_categories`
+
+Primary category taxonomy for problems (complementary to
+facet-dimensions). Rule 17. Seeded with 5 generic starters.
+
+- PK `id bigint identity`. `name text` NOT NULL.
+- Standard Rule 17 columns.
+- Partial UNIQUE `(lower(name)) WHERE status = 'published'`.
+
+### `"problem_category_tag(s)"`
+
+Junction: problem ↔ category, Rule 17 dual-reference. Same shape as
+`"product_service_category_tag(s)"` but targeting problems.
+
+### `problem_dimensions`
+
+Facet axes for problem similarity (severity, cause, domain, ...). Rule 17.
+Seeded with 3 rows (`severity`, `cause`, `domain`).
+
+- PK `id bigint identity`. `name text` NOT NULL, `description text`.
+- Rule 17 lifecycle columns.
+- Partial UNIQUE `(lower(name)) WHERE status = 'published'`.
+- No row cap — unlike category tables, dimensions can reasonably have
+  5–10+ published values.
+
+### `problem_dimension_values`
+
+Per-dimension value vocabulary. Rule 17. Seeded with severity (minor /
+moderate / serious / critical), cause (mechanical / chemical / thermal /
+electrical / environmental), domain (facility / equipment / process /
+personnel).
+
+- PK `id bigint identity`. `dimension_id bigint` FK ON DELETE CASCADE.
+  `value_name text` NOT NULL. `ordinal smallint` (optional sort key).
+- Rule 17 lifecycle columns.
+- Partial UNIQUE `(dimension_id, lower(value_name)) WHERE status = 'published'`.
+
+### `"problem_dimension_tag(s)"`
+
+Faceted tagging of problems with dimension values. Multi-valued per
+dimension (one problem can carry many rows per dimension, each a
+different value). Rule 17 dual-reference enforces cross-tenant display
+consistency for proposed values.
+
+- `problem_id` FK ON DELETE CASCADE.
+- `dimension_id` FK. `value_id` FK (intent). `fallback_value_id` FK
+  (required when `value_id.status = 'proposed'`).
+- UNIQUE `(problem_id, dimension_id, value_id)`.
+- Trigger `problem_dim_tag_dual_ref_chk` enforces (a) `value_id` and
+  `fallback_value_id` both belong to the tag's `dimension_id`, and (b)
+  Rule 17 dual-reference invariants.
+- RLS: SELECT open to all authenticated; INSERT / UPDATE / DELETE gated
+  by `tagged_by_org_id = current_user_org()`.
+
+### `"problem_case(s)"`
+
+Case studies — per-org accounts of encountering a problem and the
+solution bundle that was tried. Open-author (anyone authenticated may
+submit as `'proposed'`); sysadmin moderates to `'published'`. The author
+org may edit or delete while still proposed; once published only sysadmin
+can touch.
+
+- PK `id uuid`. `problem_id uuid` FK ON DELETE RESTRICT.
+  `reporter_entity_id uuid` FK `"Entity(s)"` — the Entity the case is
+  about (solo-Entity pattern per Rule 8). `narrative text`,
+  `occurred_at timestamptz`.
+- Rule 17 lifecycle columns + `problem_case_status_dates_chk`.
+- Audit block + `updated_at` via `public.touch_updated_at()`.
+- RLS: SELECT per Rule 17 visibility; INSERT / UPDATE / DELETE allow the
+  proposer's org while `status = 'proposed'`, sysadmin otherwise.
+
+### `problem_case_solutions`
+
+Junction: a case uses these products/services. Many-to-many, `position`
+for display ordering, `notes` for case-specific commentary.
+
+- `case_id` FK ON DELETE CASCADE. `product_service_id` FK ON DELETE RESTRICT.
+  UNIQUE `(case_id, product_service_id)`.
+- RLS: SELECT visible if the parent case is visible (EXISTS check);
+  write policies delegate to the parent case's proposer-org-while-
+  proposed rule.
+
+### `problem_case_ratings`
+
+Normalized multi-dim ratings on problem cases. `case_solution_id IS NULL`
+→ case-level headline; NOT NULL → per-product-within-case detail.
+
+- PK `id uuid`. `case_id` FK ON DELETE CASCADE. `case_solution_id` FK
+  (nullable) ON DELETE CASCADE. `dimension` is the shared
+  `public.rating_dimension` ENUM (`effectiveness | cost | safety`).
+  `score smallint` CHECK BETWEEN 1 AND 5. `comment text`, `rated_at`.
+- Two partial unique indexes: one per-case-level `(case_id, dimension)`
+  WHERE `case_solution_id IS NULL`; one per-solution
+  `(case_id, case_solution_id, dimension)` WHERE `case_solution_id IS NOT NULL`.
+- Trigger `problem_case_rating_case_match` enforces
+  `case_solution_id.case_id = this.case_id`.
+- Write RLS delegates to the parent case's proposer-org-while-proposed
+  rule.
+
+---
+
+## Tables — Physical items layer (`"11_physical"`)
+
+Tenant-owned physical asset tree (equipment, trucks, pumps, valves, etc.)
+with global category taxonomy. All tables here are full-CRUD RLS gated
+on `org_id = current_user_org()` per Rule 10, except the category
+tables (global Rule 17).
+
+### `physical_item_categories`
+
+Global per-level taxonomy. Single table with `level smallint CHECK 1..3`
+discriminator; partial UNIQUE per level on `(level, lower(name)) WHERE
+status = 'published'`. Rule 17. Seeded with L1 starters (Vehicles, Pumps,
+Valves, Tanks, Computers, Tools), L2 starters (Engine Components,
+Electrical, Structural, Interior, Exterior), and L3 starters (Fastener,
+Seal, Wire, Bearing).
+
+### `physical_item_l1_subcategories`
+
+Subcategories under L1 categories (the only level with a subcat tier).
+`parent_category_id` FK ON DELETE CASCADE; trigger
+`physical_item_l1_subcat_parent_level_chk` enforces that the parent is
+level=1. Rule 17. Seeded with examples per L1 category (Vehicles: On-Road
+/ Off-Road; Pumps: Centrifugal / Positive Displacement; etc.).
+
+### `"physical_item(s)"`
+
+The tree itself. Self-FK via `parent_id` ON DELETE CASCADE. `level 1..3`.
+Tenant-owned (`org_id` NOT NULL FK `"org(s)"`).
+
+- PK `id uuid`. `org_id uuid` NOT NULL. `level smallint CHECK 1..3`.
+  `parent_id uuid` nullable (NULL when level=1 OR when a level>1 item is
+  currently detached — see `physical_item_level1_no_parent` constraint).
+- `name text` NOT NULL. `serial_number text`, `description text`.
+- `product_service_id uuid` nullable FK to catalog — when set, this
+  physical item is an instance of a specific catalog product type. CHECK
+  trigger enforces `product_service.kind = 'product'` (services can't be
+  "instantiated" as physical things).
+- `category_id bigint` nullable FK `physical_item_categories`. Trigger
+  enforces `category.level = this.level`.
+- `l1_subcategory_id bigint` nullable FK `physical_item_l1_subcategories`.
+  CHECK `physical_item_l1_subcat_only_for_l1` — only L1 items may carry
+  an L1 subcategory.
+- `deleted_at` for soft delete. Standard audit block.
+- Invariants trigger `physical_item_invariants_chk` enforces:
+  parent.level=this.level-1, parent.org=this.org, category.level match,
+  catalog ref is kind=product.
+- RLS per Rule 10 (full CRUD gated by `org_id = current_user_org()`).
+
+### `"physical_item_attachment(s)"`
+
+Temporal parent-child attachment log. Records every tire swap, engine
+replacement, etc. Active rows have `detached_at IS NULL`; historical
+rows have both timestamps.
+
+- `parent_id`, `child_id` both FK `"physical_item(s)"` ON DELETE CASCADE.
+  `org_id uuid` NOT NULL (denormalized for RLS).
+- `attached_at`, `detached_at` (nullable), `detach_reason text`.
+- CHECK `parent_id <> child_id`, `detached_at >= attached_at`.
+- Partial UNIQUE `(child_id) WHERE detached_at IS NULL` — a part is
+  attached to at most one parent at a time.
+- Trigger `physical_item_attachment_invariants_chk` enforces:
+  parent/child share `org_id`, `this.org_id = parent.org_id`,
+  `child.level = parent.level + 1`.
+- RLS per Rule 10.
+
+### `"physical_item_property(s)"`
+
+Rule 14 append-only property log. Paint color, condition, custom
+attributes. Each new value is a new row; old row's `superseded_by_id`
+points at the replacement.
+
+- `item_id` FK ON DELETE CASCADE. `org_id uuid` NOT NULL.
+  `property_name text`, `property_value text`, `value_captured_at`.
+- `superseded_by_id uuid` self-FK, `superseded_at timestamptz`. CHECK
+  `physical_item_property_superseded_pair` — both or neither.
+- Partial index `(item_id, property_name) WHERE superseded_by_id IS NULL`
+  for "current value" lookups.
+- Trigger `physical_item_property_append_only_chk` (BEFORE UPDATE)
+  rejects updates to anything except supersession columns per Rule 14.
+- Trigger `physical_item_property_org_match_chk` enforces
+  `this.org_id = item.org_id` on INSERT.
+- RLS per Rule 10 for SELECT / INSERT / UPDATE. DELETE sysadmin-only
+  (append-only tables preserve history).
+
+### `"physical_item_assignment(s)"`
+
+Temporal Entity ownership. "This truck was assigned to Fleet 1 Entity
+from X to Y, then Fleet 2 Entity from Y to now."
+
+- `item_id`, `entity_id` FKs; `org_id uuid` NOT NULL. `assigned_at`,
+  `unassigned_at` (nullable), `assignment_reason text`.
+- CHECK `unassigned_at >= assigned_at`.
+- Partial UNIQUE `(item_id) WHERE unassigned_at IS NULL` — one active
+  assignment per item.
+- Trigger `physical_item_assignment_invariants_chk` enforces
+  cross-tenant assignment block (entity.org_id must match item.org_id
+  must match this.org_id).
+- RLS per Rule 10.
+
+---
+
+## Tables — Tenant overlay & offerings (`"12_overlay"`)
+
+Per-tenant overlays on top of the global catalog and physical items:
+private tag vocabulary + public marketing offerings.
+
+### `"org_tag(s)"`
+
+Tenant-private tag vocabulary. Rename a tag once, every junction row
+updates implicitly (they reference by id).
+
+- PK `id uuid`. `org_id uuid` NOT NULL FK ON DELETE CASCADE. `name text`
+  NOT NULL. `color text` (hex, optional). `applies_to text CHECK IN
+  ('catalog','physical','either')` default `'either'`.
+- UNIQUE `(org_id, lower(name))` via expression index.
+- RLS per Rule 10.
+
+### `"product_service_tag(s)"`
+
+Junction tagging catalog rows with tenant-private tags.
+
+- `org_id`, `product_service_id`, `tag_id` FKs. UNIQUE
+  `(org_id, product_service_id, tag_id)`.
+- Trigger `product_service_tag_invariants_chk` enforces
+  `tag.org_id = this.org_id` and `tag.applies_to IN ('catalog','either')`.
+- RLS per Rule 10 (SELECT / INSERT / UPDATE / DELETE all gated by
+  `org_id = current_user_org()`).
+
+### `"physical_item_tag(s)"`
+
+Junction tagging physical items with tenant-private tags.
+
+- `org_id`, `physical_item_id`, `tag_id` FKs. UNIQUE
+  `(org_id, physical_item_id, tag_id)`.
+- Trigger `physical_item_tag_invariants_chk` enforces `tag.org_id =
+  this.org_id`, `tag.applies_to IN ('physical','either')`, and
+  `item.org_id = this.org_id` (cross-tenant tagging blocked).
+- RLS per Rule 10.
+
+### `"org_offering(s)"`
+
+Tenant-published marketing: which catalog products/services this org
+offers to customers. This is the "discovery" surface — SELECT is open
+to all authenticated users so a buyer can search "who does X."
+Internal capability (owning a recipe for a service) is tracked separately
+by `"process_template(s)".product_service_id` and does NOT imply
+offering.
+
+- PK `id uuid`. `org_id`, `product_service_id` FKs ON DELETE CASCADE.
+  UNIQUE `(org_id, product_service_id)`.
+- `description text`, `price_range_low / _high numeric(12,2)` (CHECK
+  low <= high), `currency text` default 'USD', `service_areas text[]`,
+  `contact_entity_id uuid` FK `"Entity(s)"`, `is_active boolean`.
+- Standard audit + `updated_at` via `public.touch_updated_at()`.
+- RLS: **SELECT open to all authenticated** (offerings are marketing);
+  INSERT / UPDATE / DELETE gated by `org_id = current_user_org()`.
+
+---
+
+## Tables — Recipe extensions (phase 7 additions to existing layers)
+
+Not a new schema — these tables extend `"06_templates"` to link recipes
+to the new catalog and physical-item world.
+
+### `"06_templates"."process_template(s)".product_service_id`
+
+New nullable FK column added 2026-04-23. Links a recipe to the catalog
+row it fulfills. Products and services both get recipes (per-org
+variants allowed — multiple templates can fulfill the same catalog row).
+
+### `process_template_problems`
+
+N:N junction: recipes ↔ problems they solve. Discovery query:
+"problem X → which published cases used which product/service → which
+recipes (per org offering that service) target problem X."
+
+- `process_template_id` FK ON DELETE CASCADE. `problem_id` FK ON DELETE
+  RESTRICT. UNIQUE `(process_template_id, problem_id)`. `position
+  smallint` for org-internal preference ranking; `notes text`.
+- RLS gated via parent template's `org_id`.
+
+### `"node_template_physical_requirement(s)"`
+
+Step-level physical input declaration. Exactly one of three nullable FKs
+must be populated (`node_template_phys_req_exactly_one` CHECK):
+
+- `required_product_service_id` — a specific catalog product type
+  (e.g. "Model 3000 Pump"). Trigger enforces `kind = 'product'`.
+- `required_category_id` — any physical item of this category
+  (e.g. "any truck").
+- `required_physical_item_id` — this specific asset. Trigger enforces
+  same-org as the template.
+- `quantity smallint NOT NULL DEFAULT 1 CHECK > 0`, `notes text`.
+- Runtime binding to an actual `"moment_node(s)"` physical usage
+  happens at moment-node creation time (out of scope for this template
+  layer).
+- RLS gated via parent `"node_template(s)"`.org_id`.
