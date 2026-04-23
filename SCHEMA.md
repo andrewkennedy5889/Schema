@@ -627,6 +627,62 @@ Author-controlled expansion of note visibility to additional viewers.
 
 ---
 
+## Tables — Roles & Responsibilities (`"06_templates"`)
+
+### `"role(s)"`
+
+Per-org reusable role definition (functional hat). Responsibilities attach
+via `role_responsibilities`. Roles are bundled into Titles via `title_roles`,
+and assigned to Entities via `role_assignments` (Migration 4). Edits live-
+propagate to holders via the `effective_roles` view (Migration 5).
+
+- `id uuid` (PK). `org_id uuid` FK `"org(s)".id` `ON DELETE CASCADE`.
+- `name text` NOT NULL 1..120 chars. Partial UNIQUE
+  `(org_id, lower(name)) WHERE deleted_at IS NULL`.
+- `description text` nullable.
+- `declared_primary_swim_lane_id bigint` nullable, FK
+  `"03_metadata"."swim_lane(s)".id` `ON DELETE SET NULL`.
+- Soft delete `deleted_at`. Audit: `created_at`, `updated_at` (trigger
+  `public.touch_updated_at`), `created_by_person_id`, `updated_by_person_id`.
+- RLS: full CRUD per Rule 10, gated on `org_id = current_user_org()`.
+
+### `"responsibility(s)"`
+
+Per-org ongoing accountability. Broader than a repeating task — a
+Responsibility may contain zero, one, or many recurring tasks (Migration 6)
+and/or one-off `moment_node(s)` of type Task (Migration 7). Attaches to
+Roles via `role_responsibilities`.
+
+- `id uuid` (PK). `org_id uuid` FK `"org(s)".id` `ON DELETE CASCADE`.
+- `name text` NOT NULL 1..160 chars. Partial UNIQUE
+  `(org_id, lower(name)) WHERE deleted_at IS NULL`.
+- `description text` nullable.
+- `declared_primary_swim_lane_id bigint` nullable, FK
+  `"03_metadata"."swim_lane(s)".id` `ON DELETE SET NULL`.
+- Soft delete + audit as above.
+- RLS: full CRUD per Rule 10, gated on `org_id = current_user_org()`.
+
+### `role_responsibilities`
+
+M:N junction linking a `role(s)` to its `responsibility(s)`. Composite PK
+`(role_id, responsibility_id)`; cascade deletes from either side.
+
+- `position smallint` nullable — org-internal ranking within the role.
+- RLS: SELECT/INSERT/DELETE gated via EXISTS on parent `role(s).org_id`
+  (INSERT also requires `responsibility_id` owned by the same org).
+
+### `title_roles`
+
+M:N junction bundling `role(s)` into a `title(s)`. Holding the title
+confers every bundled role (derivation via `effective_roles` view —
+Migration 5, Q18 decision). Composite PK `(title_id, role_id)`; cascade
+deletes from either side.
+
+- `position smallint` nullable — display order within the title's bundle.
+- RLS: SELECT/INSERT/DELETE gated via EXISTS on parent `title(s).org_id`.
+
+---
+
 ## Tables — Workflow / Process containers
 
 ### `"workflow_template(s)"`
