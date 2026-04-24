@@ -272,7 +272,7 @@ decision entry.
 
   | Schema | Contents |
   |---|---|
-  | `"01_tenancy"` | `"org(s)"`, `org_types`, `"Person(s)"`, `system_administrators`, `org_admins`, `org_admin_requests`, `org_member_requests`, `org_email_domains`, `pending_signups` |
+  | `"01_tenancy"` | `"org(s)"`, `org_types`, `"Person(s)"`, `system_administrators`, `org_admins`, `org_admin_requests`, `org_member_requests`, `org_email_domains`, `pending_signups`, `tenancy_audit_log` |
   | `"02_hierarchy"` | `Div1..Div5` |
   | `"03_metadata"` | `table_registry`, `table_nicknames` |
   | `"04_entities"` | `"Entity(s)"`, `"Entity(s)_members"` |
@@ -465,6 +465,12 @@ Who administers which org. A Person may admin at most one row per org
 - `granted_via text` CHECK constraint: `NULL OR IN ('sysadmin_approval',
   'manual_bootstrap', 'self_created_org')` — tracks the bootstrap path.
 - `revoked_at timestamptz` nullable — all checks filter `revoked_at IS NULL`.
+- `revoked_by_system_admin_id uuid` → `system_administrators(person_id)` (Phase L,
+  migration `20260424000013_phase_l_org_admins_audit_columns.sql`). Populated
+  only when revocation came from sysadmin force-remove (`/api/force-remove-admin`).
+  NULL for self-resign (Phase K) or leave-org (Phase L.1) paths.
+- `revoked_at_reason text` nullable — optional free-text rationale captured by
+  `/api/force-remove-admin` body `{reason}`. Not rendered verbatim in directory UIs.
 - Partial indexes: `org_admins_org_idx (org_id) WHERE revoked_at IS NULL`
   and `org_admins_person_idx (person_id) WHERE revoked_at IS NULL`.
 - RLS: SELECT by own-org-members or sysadmin. INSERT/UPDATE/DELETE: sysadmin
@@ -569,6 +575,35 @@ House Rule 17 (moderated seeded catalogs).
   rejected rows visible to the proposer's org members and sysadmins.
   INSERT allows any authenticated user to submit a `'proposed'` row scoped
   to their own `current_user_org()`. UPDATE / DELETE are sysadmin-only.
+
+### `tenancy_audit_log`
+
+Append-only audit log for privileged tenancy operations. Added in Phase L
+(migration `20260424000014_phase_l_tenancy_audit_log.sql`). Writes come
+from Next.js server routes through `lib/audit.ts` using the service-role
+client; there is no authenticated-user INSERT policy.
+
+- PK `id uuid DEFAULT gen_random_uuid()`.
+- `actor_person_id uuid` → `"Person(s)"(id)` — who initiated the action.
+  NULL permitted for system-initiated actions.
+- `action text NOT NULL` with CHECK constraint restricting values to:
+  `leave_org`, `remove_member`, `force_remove_admin`,
+  `approve_member_request`, `deny_member_request`,
+  `approve_admin_request`, `deny_admin_request`, `resign_admin`,
+  `verify_org`, `unverify_org`, `create_org_self_serve`.
+- `target_person_id uuid` → `"Person(s)"(id)` — the subject of the action.
+- `target_org_id uuid` → `"org(s)"(id)` — the org the action was scoped to.
+- `details jsonb` — free-form structured context (reason, before/after ids, etc).
+- `created_at timestamptz NOT NULL DEFAULT now()`.
+- Indexes: `tenancy_audit_log_created_at (created_at DESC)` for recency
+  scans and `tenancy_audit_log_target_org_id (target_org_id)` for
+  per-org queries.
+- **RLS**: SELECT for sysadmin only. No authenticated INSERT/UPDATE/DELETE
+  policies — only service-role writes. Append-only by design.
+- Covers retrofitted Phase J/K endpoints (decide-member-request,
+  decide-admin-request, resign-admin) + Phase L endpoints
+  (leave-org, remove-member, force-remove-admin). The Phase N sysadmin
+  audit-log viewer (not yet built) reads this table.
 
 ---
 
