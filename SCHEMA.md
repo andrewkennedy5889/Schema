@@ -135,9 +135,20 @@ decision entry.
   used by INSERT policy on shares.
 - `person_solo_entity_id(person_id)` → returns the solo-Entity id for the
   given Person (see Rule 8).
-- `is_system_admin()` → boolean; true iff `auth.uid()` has a row in
-  `system_admins`. Used by `org_types` RLS and will be used by any future
-  sysadmin-gated table.
+- `is_system_admin()` → boolean; true iff `auth.uid()` maps (via
+  `Person(s).user_id = auth.uid()`) to a row in `system_administrators`.
+  Used by `org_types` RLS and every auth/tenancy policy (org_admins,
+  org_*_requests, org_email_domains, pending_signups).
+- `is_org_admin(target_org_id uuid)` → boolean; true iff the current user's
+  Person has an active (`revoked_at IS NULL`) row in `org_admins` for the
+  target org.
+- `current_person_id()` → resolves `auth.uid()` to `Person(s).id`.
+- `generate_org_slug(_name text)` → kebab-cased slug with collision suffix
+  (`-2`, `-3`, …). Pure STABLE helper used by `create_org_self_serve`.
+- `create_org_self_serve(_name, _website, _domain, _creator_auth_user_id)`
+  → SECURITY DEFINER atomic INSERT into `org(s)` (is_verified=false) +
+  `org_email_domains` + `pending_signups`. Used by `/api/create-org-and-
+  signup`.
 
 ### 10. Tenant-owned tables get full CRUD RLS; admin-managed tables get SELECT-only
 
@@ -228,7 +239,7 @@ decision entry.
 
   | Schema | Contents |
   |---|---|
-  | `"01_tenancy"` | `"org(s)"`, `org_types`, `"Person(s)"`, `system_admins` |
+  | `"01_tenancy"` | `"org(s)"`, `org_types`, `"Person(s)"`, `system_administrators`, `org_admins`, `org_admin_requests`, `org_member_requests`, `org_email_domains`, `pending_signups` |
   | `"02_hierarchy"` | `Div1..Div5` |
   | `"03_metadata"` | `table_registry`, `table_nicknames` |
   | `"04_entities"` | `"Entity(s)"`, `"Entity(s)_members"` |
@@ -386,18 +397,84 @@ Chained below `Div1` via `parent_id`. RLS traces the parent chain up to
 
 ## Tables — System admin + org typing
 
-### `system_admins`
+### `system_administrators`
 
-Cross-tenant privileged role. A user listed here has system-admin access
+Cross-tenant privileged role. A Person listed here has system-admin access
 regardless of tenant. Intentionally has no `org_id` — scope is global.
 
-- PK `user_id uuid` (FK `auth.users.id` ON DELETE CASCADE).
-- RLS: SELECT gated by `user_id = auth.uid()` — users can see their own row
-  (enough for the app to render "am I a sysadmin?" state). No write policies
-  from `authenticated`; bootstrap and ongoing management go through direct
-  SQL under the service role.
+- PK `person_id uuid` (FK `"01_tenancy"."Person(s)".id` ON DELETE CASCADE).
+- `granted_at timestamptz NOT NULL DEFAULT now()`.
+- `granted_by uuid REFERENCES "01_tenancy"."Person(s)"(id)` — who seeded the
+  admin (self-reference for the genesis row).
+- RLS: SELECT gated by `is_system_admin() OR person_id = current_person_id()`.
+  No write policies — bootstrap and management go through the service role.
 - Membership is wrapped by `is_system_admin()` (House Rule 9) so downstream
-  RLS can check sysadmin status without recursing into this table's own RLS.
+  RLS can check sysadmin status without recursing into this table.
+- **Replaces the prior `system_admins(user_id)` table** (2026-04-24, Phase A
+  of AUTH-TENANCY-PRD v2). Keyed to `Person(s)` rather than `auth.users`
+  directly so sysadmin identity survives auth-user deletion and matches
+  the person-id audit columns on `org_admins.granted_by_system_admin_id`,
+  `org_admin_requests.decided_by`, and
+  `org_email_domains.verified_by_system_admin_id`.
+
+### `org_admins`
+
+Who administers which org. A Person may admin at most one row per org
+(UNIQUE `(org_id, person_id)`), and revocation is a soft-flag.
+
+- PK `id uuid`. `org_id uuid NOT NULL` → `"org(s)".id`. `person_id uuid
+  NOT NULL` → `"Person(s)".id` (both ON DELETE CASCADE).
+- `granted_at timestamptz NOT NULL DEFAULT now()`.
+- `granted_by_system_admin_id uuid` → `system_administrators(person_id)`.
+- `granted_via text` CHECK constraint: `NULL OR IN ('sysadmin_approval',
+  'manual_bootstrap', 'self_created_org')` — tracks the bootstrap path.
+- `revoked_at timestamptz` nullable — all checks filter `revoked_at IS NULL`.
+- Partial indexes: `org_admins_org_idx (org_id) WHERE revoked_at IS NULL`
+  and `org_admins_person_idx (person_id) WHERE revoked_at IS NULL`.
+- RLS: SELECT by own-org-members or sysadmin. INSERT/UPDATE/DELETE: sysadmin
+  only (Phase F trigger sets rows via service role).
+
+### `org_admin_requests` and `org_member_requests`
+
+Two request queues keyed off the `public.request_status` enum (`pending`,
+`approved`, `denied`, `withdrawn`).
+
+- `org_admin_requests`: person asks to become an admin of an org.
+  `decided_by` → `system_administrators(person_id)`.
+- `org_member_requests`: person asks to join an org when email domain
+  doesn't auto-match. `decided_by` → `"Person(s)"(id)` (admin-approval).
+- Both tables carry partial UNIQUE indexes on `(org_id, person_id) WHERE
+  status='pending'` so a given person has at most one open request per org.
+- RLS: self + sysadmin (+ org_admin on member_requests) can SELECT; self
+  can INSERT pending; self can UPDATE to `withdrawn`; admins/sysadmins can
+  decide.
+
+### `org_email_domains`
+
+One email domain → one org. Used for auto-join.
+
+- UNIQUE on `domain` (case-normalized via CHECK `domain = lower(domain)`).
+- `verified_at timestamptz` nullable — rows created by
+  `create_org_self_serve` self-verify (creator passed MX + website checks);
+  sysadmin can re-verify or add additional domains.
+- `verified_by_system_admin_id uuid` → `system_administrators(person_id)`.
+- RLS: globally readable (anon + authenticated) so the signup form can
+  check domain match. Writes sysadmin-only.
+
+### `pending_signups`
+
+Bridges `auth.users.created` → `auth.users.email_confirmed_at` for the
+post-verification trigger (Phase F).
+
+- PK `auth_user_id uuid` → `auth.users.id` ON DELETE CASCADE.
+- `intent_org_id uuid NOT NULL` → `"org(s)".id` — which org the user picked
+  in the combo box (or just created).
+- `new_org_creator boolean NOT NULL DEFAULT false` — distinguishes a join
+  flow from the self-create flow.
+- `created_at timestamptz`, `resolved_at timestamptz`.
+- Index `pending_signups_org_idx` on `intent_org_id`.
+- RLS: SELECT self-only (`auth_user_id = (SELECT auth.uid())`) or sysadmin.
+  INSERT/UPDATE/DELETE — service role only (no policy = denied).
 
 ### `org_types`
 
