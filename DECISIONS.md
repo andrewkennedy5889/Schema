@@ -20,6 +20,13 @@ Field template:
 How to add new entries: see `UPDATING.md`.
 
 ---
+## 2026-04-24 — Anti-enumeration on `/api/request-download-link`
+
+**Affects**: `/api/request-download-link` (Phase I), returning-user magic-link flow, PRD §4.4 / §9 Phase I
+**Decision**: The endpoint always responds with `{ok:true}` and HTTP 200 — regardless of whether the submitted email exists in `auth.users`, is malformed, or is missing entirely. A 100–300 ms random delay is injected on every request to blur the timing side-channel between the "user found → generateLink" path and the "no user → noop" path. `ReturningUserForm.tsx` mirrors this by showing the same "If we found your account, a sign-in link is on the way." copy regardless of response body.
+**Why**: Distinguishable responses (different status codes, different messages, or a measurable response-time delta) would let an attacker enumerate which emails already have a Nexus account, which is both a privacy leak for existing users and a useful primer for targeted phishing.
+**Alternatives rejected**: (a) Returning `404` when the email is unknown — reveals existence directly. (b) Returning `{ok:true}` but skipping the delay — keeps a timing side-channel that is trivially measurable with a handful of requests. (c) Rate-limit-only defence (Phase O, 3/hr per email) — useful but orthogonal; rate limiting slows enumeration, it does not prevent a single-shot lookup. (d) Server-side CAPTCHA — heavier UX cost than the 100–300 ms delay buys in signal reduction.
+
 
 ## 2026-04-24 — Auth/tenancy Phase F: post-verification join trigger + Person(s).user_id cascade
 
