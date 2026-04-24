@@ -165,11 +165,15 @@ decision entry.
   per Rule 16.
 - `"01_tenancy".handle_auth_user_verified()` → trigger function fired by
   the `on_auth_user_verified` AFTER UPDATE OF `email_confirmed_at` trigger
-  on `auth.users` (Phase F of AUTH-TENANCY-PRD v2). WHEN clause restricts
-  firing to the `OLD.email_confirmed_at IS NULL AND NEW.email_confirmed_at
-  IS NOT NULL` transition (i.e. the first verification, not re-confirms
-  or email-change flows). Looks up `"01_tenancy"."pending_signups"` for
-  `NEW.id` filtered to `resolved_at IS NULL`; no-op if none found.
+  on `auth.users` (Phase F of AUTH-TENANCY-PRD v2; hardened in Phase O.1).
+  WHEN clause restricts firing to the `OLD.email_confirmed_at IS NULL AND
+  NEW.email_confirmed_at IS NOT NULL` transition. Phase O.1 adds two extra
+  idempotency guards on top of Phase F: (1) explicit `resolved_at IS NULL`
+  filter on the `pending_signups` lookup so re-confirmations / email-change
+  flows that re-fire the transition become no-ops once the intent is
+  resolved; (2) short-circuit if the Person row is already off the sentinel
+  (`_current_org <> '00000000-0000-0000-0000-000000000001'`) — prefer
+  to soft-resolve the dangling pending row rather than re-route the Person.
   Branches: (a) `new_org_creator=true` → transfer Person to `intent_org_id`
   + `INSERT INTO org_admins (...granted_via='self_created_org') ON CONFLICT
   DO NOTHING`; (b) verified-domain match on `split_part(lower(NEW.email),
@@ -182,6 +186,16 @@ decision entry.
   `SET search_path=''` per Rule 16. Does not call
   `attempt_link_existing_person` — that helper is not defined in this
   project because multi-org membership is out of scope per PRD §10.
+- `"01_tenancy".person_block_org_field_for_non_service()` → BEFORE UPDATE
+  trigger on `"01_tenancy"."Person(s)"` (Phase O.2 of AUTH-TENANCY-PRD v2).
+  Raises `42501 insufficient_privilege` when `NEW."Person's_org" IS DISTINCT
+  FROM OLD."Person's_org"` AND `current_setting('role')` is not in
+  (`service_role`, `postgres`, `supabase_admin`). Complements the new
+  broad `authenticated` UPDATE policy `"Users can update their own Person
+  row"` (RLS `user_id = auth.uid()`) so that profile-field UPDATEs work
+  while the sentinel invariant (PRD §11) stays service-role-only.
+  Service-role writes and SECURITY DEFINER triggers owned by `postgres`
+  bypass the guard. `SECURITY DEFINER` + `SET search_path=''` per Rule 16.
 
 ### 10. Tenant-owned tables get full CRUD RLS; admin-managed tables get SELECT-only
 
