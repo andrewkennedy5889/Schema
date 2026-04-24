@@ -163,6 +163,25 @@ decision entry.
   `auth.users.raw_user_meta_data` and exposes to the trigger's `NEW`
   record with zero extra plumbing. `SECURITY DEFINER` + `SET search_path=''`
   per Rule 16.
+- `"01_tenancy".handle_auth_user_verified()` → trigger function fired by
+  the `on_auth_user_verified` AFTER UPDATE OF `email_confirmed_at` trigger
+  on `auth.users` (Phase F of AUTH-TENANCY-PRD v2). WHEN clause restricts
+  firing to the `OLD.email_confirmed_at IS NULL AND NEW.email_confirmed_at
+  IS NOT NULL` transition (i.e. the first verification, not re-confirms
+  or email-change flows). Looks up `"01_tenancy"."pending_signups"` for
+  `NEW.id` filtered to `resolved_at IS NULL`; no-op if none found.
+  Branches: (a) `new_org_creator=true` → transfer Person to `intent_org_id`
+  + `INSERT INTO org_admins (...granted_via='self_created_org') ON CONFLICT
+  DO NOTHING`; (b) verified-domain match on `split_part(lower(NEW.email),
+  '@', 2)` against `org_email_domains WHERE verified_at IS NOT NULL` →
+  transfer Person to `intent_org_id`; (c) else → `INSERT INTO
+  org_member_requests (status='pending') ON CONFLICT DO NOTHING` (partial
+  unique `org_member_requests_one_open` handles dedup). After any branch,
+  `UPDATE pending_signups SET resolved_at = now()` — soft-resolve rather
+  than DELETE so the signup intent is auditable. `SECURITY DEFINER` +
+  `SET search_path=''` per Rule 16. Does not call
+  `attempt_link_existing_person` — that helper is not defined in this
+  project because multi-org membership is out of scope per PRD §10.
 
 ### 10. Tenant-owned tables get full CRUD RLS; admin-managed tables get SELECT-only
 
@@ -346,7 +365,10 @@ Root tenant table. Every other tenant-owned row points back here.
 A person within an org. May or may not have an `auth.users` login.
 
 - `id uuid` (PK) — internal stable Person ID.
-- `user_id uuid` nullable, FK `auth.users.id` — the login, if any.
+- `user_id uuid` nullable, FK `auth.users.id` `ON DELETE CASCADE` — the
+  login, if any. Deleting the `auth.users` row cascades to this Person so
+  test cleanup doesn't leave orphans. (Flipped from the implicit SET NULL
+  that Phase B produced; see DECISIONS.md 2026-04-24 Phase F entry.)
 - `"Person's_org" uuid` (default `auth.uid()`) — tenant link. Quirky legacy
   column name; keep exactly as-is.
 - `div1_id..div5_id bigint` nullable — Div-tier placement.
