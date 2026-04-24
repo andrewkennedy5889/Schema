@@ -149,6 +149,20 @@ decision entry.
   → SECURITY DEFINER atomic INSERT into `org(s)` (is_verified=false) +
   `org_email_domains` + `pending_signups`. Used by `/api/create-org-and-
   signup`.
+- `"01_tenancy".handle_new_auth_user()` → trigger function fired by the
+  `on_auth_user_created` AFTER INSERT trigger on `auth.users` (Phase B of
+  AUTH-TENANCY-PRD v2). Creates a `Person(s)` row with `user_id = NEW.id`,
+  `first_name`/`last_name` pulled from `NEW.raw_user_meta_data` (coalesced
+  to `''` because both columns are NOT NULL), and `"Person's_org"` set to
+  the public sentinel `00000000-0000-0000-0000-000000000001`. Idempotent —
+  skips if a Person with that `user_id` already exists. Phase F's post-
+  verification trigger transfers the Person to the real org based on
+  `pending_signups.intent_org_id`. Metadata-driven rather than a side
+  parameter table because `/api/signup` already sets `user_metadata` on
+  `auth.admin.createUser()`, which Supabase stores as
+  `auth.users.raw_user_meta_data` and exposes to the trigger's `NEW`
+  record with zero extra plumbing. `SECURITY DEFINER` + `SET search_path=''`
+  per Rule 16.
 
 ### 10. Tenant-owned tables get full CRUD RLS; admin-managed tables get SELECT-only
 
