@@ -590,7 +590,14 @@ client; there is no authenticated-user INSERT policy.
   `leave_org`, `remove_member`, `force_remove_admin`,
   `approve_member_request`, `deny_member_request`,
   `approve_admin_request`, `deny_admin_request`, `resign_admin`,
-  `verify_org`, `unverify_org`, `create_org_self_serve`.
+  `verify_org`, `unverify_org`, `create_org_self_serve`, `auto_join`.
+  Phase M (migration
+  `20260424000015_phase_m_audit_action_auto_join.sql`) appended
+  `auto_join`, emitted by `/api/request-member` when a caller's email
+  domain matches a `verified_at IS NOT NULL` row in `org_email_domains`
+  for the target org and the caller is transferred directly into the
+  org without a pending `org_member_requests` entry. `details` carries
+  `{via: 'domain_match', domain, from_org_id, to_org_id}`.
 - `target_person_id uuid` → `"Person(s)"(id)` — the subject of the action.
 - `target_org_id uuid` → `"org(s)"(id)` — the org the action was scoped to.
 - `details jsonb` — free-form structured context (reason, before/after ids, etc).
