@@ -485,6 +485,17 @@ Two request queues keyed off the `public.request_status` enum (`pending`,
   can INSERT pending; self can UPDATE to `withdrawn`; admins/sysadmins can
   decide.
 
+- **Phase J RLS refinements** (2026-04-24, migration
+  `20260424000011_phase_j_org_member_requests_rls.sql` on `Nex4.23.26`):
+  dropped+recreated the four policies idempotently, added a sysadmin-only
+  DELETE policy, and added partial index
+  `org_member_requests_pending_requested_at (requested_at DESC) WHERE
+  status='pending'` to back the `/admin/queue` ordering. The Phase J UI
+  (`app/admin/queue/page.tsx` + `app/api/decide-member-request/route.ts`)
+  relies entirely on these policies for authorization — no hand-coded
+  filtering by org in the app. Sysadmin visibility of requests targeting
+  admin-less orgs is the `is_system_admin()` branch of the SELECT policy.
+
 ### `org_email_domains`
 
 One email domain → one org. Used for auto-join.
