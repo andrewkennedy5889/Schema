@@ -468,7 +468,13 @@ Who administers which org. A Person may admin at most one row per org
 - Partial indexes: `org_admins_org_idx (org_id) WHERE revoked_at IS NULL`
   and `org_admins_person_idx (person_id) WHERE revoked_at IS NULL`.
 - RLS: SELECT by own-org-members or sysadmin. INSERT/UPDATE/DELETE: sysadmin
-  only (Phase F trigger sets rows via service role).
+  only (Phase F trigger sets rows via service role), **plus** a self-resign
+  UPDATE policy added in Phase K (`org_admins_self_resign`, migration
+  `20260424000012_phase_k_org_admin_requests_rls.sql`): permits
+  `person_id = current_person_id() AND revoked_at IS NULL` with WITH CHECK
+  requiring `revoked_at IS NOT NULL`. Callers can flip their own
+  `revoked_at` from NULL → `now()` but cannot un-revoke or touch other
+  admins' rows. Sysadmin-only UPDATE policy remains for all other edits.
 
 ### `org_admin_requests` and `org_member_requests`
 
@@ -495,6 +501,24 @@ Two request queues keyed off the `public.request_status` enum (`pending`,
   relies entirely on these policies for authorization — no hand-coded
   filtering by org in the app. Sysadmin visibility of requests targeting
   admin-less orgs is the `is_system_admin()` branch of the SELECT policy.
+
+- **Phase K RLS refinements** (2026-04-24, migration
+  `20260424000012_phase_k_org_admin_requests_rls.sql` on `Nex4.23.26`):
+  dropped+recreated the `oar_*` policies on `org_admin_requests`
+  idempotently — SELECT = `self OR is_system_admin()` (requester sees own
+  rows; sysadmins drive the `/admin/queue` admin-requests section); INSERT
+  = `person_id = current_person_id() AND status='pending'` (paired with
+  route-layer membership + zero-member bootstrap check in
+  `/api/request-org-admin`); UPDATE USING = `sysadmin OR self`, WITH CHECK
+  = `sysadmin OR (self AND status='withdrawn')` so requesters can only
+  transition their own row to `withdrawn` while sysadmins decide
+  approved/denied; DELETE = sysadmin only. Added partial index
+  `org_admin_requests_pending_requested_at (requested_at DESC) WHERE
+  status='pending'` for the queue ordering. The Phase K UI
+  (`app/admin/queue/page.tsx` admin-requests section +
+  `app/api/decide-admin-request/route.ts` + `app/api/request-org-admin/route.ts`
+  + `app/api/resign-admin/route.ts`) relies on these policies plus
+  `org_admins_self_resign` (on `org_admins`) for all authorization.
 
 ### `org_email_domains`
 
